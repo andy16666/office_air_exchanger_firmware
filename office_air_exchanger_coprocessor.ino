@@ -8,22 +8,24 @@
 
 using namespace rtos; 
 
-Semaphore motorLock(1); 
-Semaphore inputLock(1); 
 Semaphore temperatureLock(1); 
 
- 
-Thread t1; 
-Thread t2;
-Thread t3;  
+Thread motorThread; 
+Thread displayThread;
+Thread temperatureThread;  
 
 #define INVALID_TEMP NAN
 
 // Input Pins
 #define TEMP_SENSOR_DATA 2
+// Commands the system to attempt to lower the room temperature 
 #define CMD_TEMP_COOL 6
+// Commands the system to attempt to increase room temperature
 #define CMD_TEMP_HEAT 7
+// Request air exchange
 #define CMD_CO2_HIGH 8
+// Request a negative pressure condition in the room (preventing air from leaving, 
+// for example when a door is opened to another part of the house)
 #define CMD_EXHAUST 9
 
 // Sensor Addresses
@@ -33,9 +35,13 @@ Thread t3;
 #define EXHAUST_INLET_TEMP_ADDR 166
 
 // Output Pins
+// Puller on the outlet of the core section
 #define INTAKE_BLOWER_ON 21
+// Pusher on the inlet of the exhaust side 
 #define EXHAUST_BLOWER_ON 20
+// Puller near the fresh air intake, directly into the room 
 #define BYPASS_BLOWER_ON 19
+// Diverts air from the outlet to the inlet of the fresh air side, effectively increasing heat transfer from the core. 
 #define CORE_ASSIST_ON 18
 
 #define CORE_ASSIST_PWM 16
@@ -44,24 +50,29 @@ DS18B20 ds(TEMP_SENSOR_DATA);
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
 
-int relayDebounce;
+// Intended motor states
 volatile int intakeOn;
 volatile int exhaustOn;
 volatile int coreAssistOn;
 volatile int bypassOn;
-volatile int cmdCool    = 0; 
-volatile int cmdHeat    = 0; 
-volatile int cmdCo2High = 0; 
-volatile int cmdExhaust = 0; 
+
+// Current motor states
 volatile int intakeOnPrev = 0;
 volatile int exhaustOnPrev = 0;
 volatile int bypassOnPrev = 0;
 volatile int coreAssistOnPrev = 0;
+
+volatile int cmdCool    = 0; 
+volatile int cmdHeat    = 0; 
+volatile int cmdCo2High = 0; 
+volatile int cmdExhaust = 0; 
+
 volatile float intakeInletTempC = INVALID_TEMP; 
 volatile float intakeOutletTempC = INVALID_TEMP; 
 volatile float exhaustInletTempC = INVALID_TEMP; 
 volatile float exhaustOutletTempC = INVALID_TEMP; 
 
+// Toggled to 1 whenever any input changes
 volatile int inputsChanged = 0; 
 
 void setup() {
@@ -69,12 +80,14 @@ void setup() {
   exhaustOn = 0;
   coreAssistOn = 0;
   bypassOn = 0;
-  relayDebounce = 0;
 
+  // Commands from homebridge/homekit automations
   pinMode(CMD_TEMP_COOL, INPUT_PULLDOWN);
   pinMode(CMD_TEMP_HEAT, INPUT_PULLDOWN);
   pinMode(CMD_CO2_HIGH, INPUT_PULLDOWN);
   pinMode(CMD_EXHAUST, INPUT_PULLDOWN);
+
+  // Inputs from HK are interrupt driven to make the system instantly respond to changes. 
   attachInterrupt(digitalPinToInterrupt(CMD_TEMP_COOL), handleInputChange, CHANGE);
   attachInterrupt(digitalPinToInterrupt(CMD_TEMP_HEAT), handleInputChange, CHANGE);
   attachInterrupt(digitalPinToInterrupt(CMD_CO2_HIGH),  handleInputChange, CHANGE);
@@ -120,12 +133,12 @@ void setup() {
   lcd.print("Starting Up...");
   delay(1000);
 
-  t3.start(mbed::callback(temperatureThread));
-  reReadInputs();
-  t2.start(mbed::callback(displayThread));
-  t1.start(mbed::callback(motorThread));
+  temperatureThread.start(mbed::callback(temperatureThreadImpl));
+  displayThread.start(mbed::callback(displayThreadImpl));
+  motorThread.start(mbed::callback(motorThreadImpl));
 }
 
+void loop() { }
 
 int countSensors() {
   int count = 0;
@@ -163,40 +176,57 @@ void updateTemperature(int requestedAddress, int* address, float* tempC, int nSe
   float newTempC = getTempC(requestedAddress, address, tempC, nSensors); 
 
   if (
-       *currentTempC != newTempC 
-    && newTempC != INVALID_TEMP 
-    && newTempC == newTempC     // NAN check
+       newTempC != INVALID_TEMP 
+    && newTempC == newTempC     // NaN check
   )
   {
+    // Compare truncated to 1 decimal place 
+    int significantChange = (int)(*currentTempC * 10.0) != (int)(newTempC * 10.0); 
     *currentTempC = newTempC; 
-    inputsChanged = 1; 
+    if (significantChange)
+    {
+      inputsChanged = 1; 
+    }
   }
 }
 
 void recomputeMotorStates() {
   temperatureLock.acquire(); 
-  const float targetRoomTemp = 19.0; 
-  const float coolTemp = targetRoomTemp - 1.0; 
-  const float heatTemp = targetRoomTemp + 2.0; 
+  const float TARGET_TEMP_C = 19.0; 
+  // Target air strem temp for cooling 
+  const float COOL_TEMP_C = TARGET_TEMP_C - 2.0; 
+  // Target air stream temp for heating
+  const float HEAT_TEMP_C = TARGET_TEMP_C + 2.0; 
 
+  // Are we heating or cooling? 
   int tempControlEnable = cmdHeat || cmdCool; 
 
+  // Average temperature of the exhaust side of the core
   float exhaustCoreTemp = (exhaustOutletTempC + exhaustInletTempC)
                           /2.0;
+  // Average temperature of the intake side of the core
   float intakeCoreTemp  = (intakeInletTempC + intakeOutletTempC)
                           /2.0;
+  // Average core temperature
   float coreTemp = (exhaustCoreTemp + intakeCoreTemp)
                           /2.0;
 
-  int coolAvailableIntake = intakeOnPrev ? intakeOutletTempC < coolTemp : coreTemp < coolTemp;
-  int heatAvailableIntake = intakeOnPrev ? intakeOutletTempC > heatTemp : coreTemp < heatTemp;
+  // Is cooling air available? If the intake has been off, approximate using core temp. 
+  int coolAvailableIntake = intakeOnPrev ? intakeOutletTempC < COOL_TEMP_C : coreTemp < COOL_TEMP_C;
+  // Is heating air available? ""
+  int heatAvailableIntake = intakeOnPrev ? intakeOutletTempC > HEAT_TEMP_C : coreTemp < HEAT_TEMP_C;
+  // Is the intake air useful for controlling temperature
   int intakeEnableTempControl = (cmdCool && coolAvailableIntake) || (cmdHeat && heatAvailableIntake); 
 
+  // Is the exhaust side useful for controlling temperature 
   int coolAvailableExhaust = exhaustOnPrev ? exhaustCoreTemp < coreTemp : exhaustInletTempC < coreTemp; 
   int heatAvailableExhaust = exhaustOnPrev ? exhaustCoreTemp > coreTemp : exhaustInletTempC > coreTemp; 
   int exhaustEnableTempControl = (cmdCool && coolAvailableExhaust) || (cmdHeat && heatAvailableExhaust); 
-  int exhaustHot = exhaustOutletTempC > 35;
+  
+  // Try not to melt the core
+  int exhaustHot = exhaustOutletTempC > 40;
 
+  // Is the core assit feature useful for either warming or cooling the core to assist in heating or cooling? 
   int coreAssistCoolAvailable = intakeOnPrev ? coreTemp < intakeOutletTempC : 0;
   int coreAssistHeatAvailable = intakeOnPrev ? coreTemp > intakeOutletTempC : 0;
   int coreAssistAvailable = (cmdCool && coreAssistCoolAvailable) || (cmdHeat && coreAssistHeatAvailable);
@@ -214,11 +244,13 @@ void recomputeMotorStates() {
 
   exhaustOn =
     cmdExhaust
+    // Ignore CO2 high if we are controlling temperature and the exhaust is not helpful. 
     || (cmdCo2High && (exhaustEnableTempControl || !tempControlEnable))
     || exhaustHot
     || exhaustEnableTempControl
     ;
 
+  // Never risk push air backward through the intake 
   coreAssistOn =
        intakeOn
     && coreAssistAvailable
@@ -230,18 +262,22 @@ void recomputeMotorStates() {
     ;
 }
 
-void updateMotorStates() {
-  digitalWrite(INTAKE_BLOWER_ON, intakeOn ? LOW : HIGH);    // Active Low
+void updateMotorStates() 
+{
+  digitalWrite(INTAKE_BLOWER_ON,  intakeOn ? LOW : HIGH);    // Active Low
   digitalWrite(EXHAUST_BLOWER_ON, exhaustOn ? LOW : HIGH);  // Active Low
-  digitalWrite(BYPASS_BLOWER_ON, bypassOn ? LOW : HIGH);    // Active Low
-  digitalWrite(CORE_ASSIST_ON, coreAssistOn ? LOW : HIGH);  // Active Low
-  intakeOnPrev = digitalRead(INTAKE_BLOWER_ON) == LOW;    // Active Low
-  exhaustOnPrev = digitalRead(EXHAUST_BLOWER_ON) == LOW;  // Active Low
-  bypassOnPrev = digitalRead(BYPASS_BLOWER_ON) == LOW;    // Active Low
-  coreAssistOnPrev = digitalRead(CORE_ASSIST_ON) == LOW;  // Active Low
+  digitalWrite(BYPASS_BLOWER_ON,  bypassOn ? LOW : HIGH);    // Active Low
+  digitalWrite(CORE_ASSIST_ON,    coreAssistOn ? LOW : HIGH);  // Active Low
+  
+  // Save current states
+  intakeOnPrev     = intakeOn; 
+  exhaustOnPrev    = exhaustOn;
+  bypassOnPrev     = bypassOn; 
+  coreAssistOnPrev = coreAssistOn;
 }
 
-void updateDisplay() {
+void updateDisplay() 
+{
   char* buffer = (char*)malloc(1024 * sizeof(char));
   
   sprintf(buffer, "BIECaCHcE       ");
@@ -262,6 +298,7 @@ void updateDisplay() {
   lcd.setCursor(0, 1);
   lcd.print(buffer);
   rtos::ThisThread::sleep_for(5000);
+  
   temperatureLock.acquire(); 
   sprintf(buffer,
           "I%2.3f>%2.3f  ",
@@ -277,6 +314,7 @@ void updateDisplay() {
           exhaustInletTempC,
           exhaustOutletTempC);
   temperatureLock.release(); 
+
   lcd.setCursor(0, 1);
   lcd.print(buffer);
 
@@ -285,7 +323,61 @@ void updateDisplay() {
   digitalWrite(CORE_ASSIST_PWM, coreAssistOn ? LOW : HIGH);
 }
 
-void temperatureThread()
+/* ISR - Any homekit switch change */
+void handleInputChange()
+{
+  inputsChanged = 1; 
+}
+
+void reReadInputs() 
+{
+  cmdCool    = digitalRead(CMD_TEMP_COOL) == HIGH;    // Active High
+  cmdHeat    = digitalRead(CMD_TEMP_HEAT) == HIGH;    // Active High
+  cmdCo2High = digitalRead(CMD_CO2_HIGH) == HIGH;  // Active High
+  cmdExhaust = digitalRead(CMD_EXHAUST) == HIGH;   // Active High  
+}
+
+
+
+/* Computes the states the motors should be in and updates them. Runs every 60 seconds unless inputsChanged is toggled. */
+void motorThreadImpl() 
+{
+  for (;;) 
+  {
+    if (inputsChanged)
+    {
+      // Attempt to do a lock free synchronization to get a pseudo-consistent result. 
+      // If inputsChanged is toggled back on during the calculation, re-do it. 
+      do 
+      {
+        inputsChanged = 0; 
+        reReadInputs(); 
+        recomputeMotorStates();
+      } 
+      while (inputsChanged); 
+
+      int motorStatesChanged =
+           intakeOn != intakeOnPrev
+        || exhaustOn != exhaustOnPrev
+        || bypassOn != bypassOnPrev
+        || coreAssistOn != coreAssistOnPrev;
+
+      if (motorStatesChanged) 
+      {
+        updateMotorStates();
+      } 
+    }
+
+    // Wait 60 seconds or until inputs change. 
+    for (int i = 0; i < 60 && !inputsChanged; i++)
+    {
+      rtos::ThisThread::sleep_for(1000);
+    }
+  }
+}
+
+/* Reads temperature sensors */
+void temperatureThreadImpl()
 {
   for(;;)
   {
@@ -305,68 +397,8 @@ void temperatureThread()
   }
 }
 
-void handleInputChange()
+void displayThreadImpl() 
 {
-  inputsChanged = 1; 
-}
-
-void reReadInputs() 
-{
-  cmdCool = digitalRead(CMD_TEMP_COOL) == HIGH;    // Active High
-  cmdHeat = digitalRead(CMD_TEMP_HEAT) == HIGH;    // Active High
-  cmdCo2High = digitalRead(CMD_CO2_HIGH) == HIGH;  // Active High
-  cmdExhaust = digitalRead(CMD_EXHAUST) == HIGH;   // Active High  
-}
-
-void readMotorStates()
-{
-  
-}
-
-void loop() {
-
-}
-
-void motorThread() {
-  for (;;) {
-    int motorStatesChanged;
-    if (inputsChanged)
-    {
-      do 
-      {
-        inputsChanged = 0; 
-        reReadInputs(); 
-        recomputeMotorStates();
-      } 
-      while (inputsChanged);
-
-      motorStatesChanged =
-           intakeOn != intakeOnPrev
-        || exhaustOn != exhaustOnPrev
-        || bypassOn != bypassOnPrev
-        || coreAssistOn != coreAssistOnPrev;
-    }
-    else 
-    {
-      motorStatesChanged = 0; 
-    } 
-
-    if (motorStatesChanged) 
-    {
-      updateMotorStates();
-      for (int i = 0; i < 60 && !inputsChanged; i++)
-      {
-        rtos::ThisThread::sleep_for(1000);
-      }
-    } 
-    else
-    {
-      rtos::ThisThread::sleep_for(1000);
-    }
-  }
-}
-
-void displayThread() {
   for (;;) {
     updateDisplay();
     rtos::ThisThread::sleep_for(5000);
