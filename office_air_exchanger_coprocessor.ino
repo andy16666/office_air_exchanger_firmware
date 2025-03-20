@@ -46,6 +46,12 @@ Thread temperatureThread;
 
 #define CORE_ASSIST_PWM 16
 
+const float TARGET_TEMP_C = 19.0; // TODO: Make this an input from HK. 
+// Target air strem temp for cooling 
+const float COOL_TEMP_C = TARGET_TEMP_C - 2.0; 
+// Target air stream temp for heating
+const float HEAT_TEMP_C = TARGET_TEMP_C + 2.0; 
+
 DS18B20 ds(TEMP_SENSOR_DATA);
 
 LiquidCrystal_I2C lcd(0x27, 16, 2);
@@ -192,45 +198,43 @@ void updateTemperature(int requestedAddress, int* address, float* tempC, int nSe
 
 void recomputeMotorStates() {
   temperatureLock.acquire(); 
-  const float TARGET_TEMP_C = 19.0; 
-  // Target air strem temp for cooling 
-  const float COOL_TEMP_C = TARGET_TEMP_C - 2.0; 
-  // Target air stream temp for heating
-  const float HEAT_TEMP_C = TARGET_TEMP_C + 2.0; 
-
   // Are we heating or cooling? 
   int tempControlEnable = cmdHeat || cmdCool; 
 
   // Average temperature of the exhaust side of the core
-  float exhaustCoreTemp = (exhaustOutletTempC + exhaustInletTempC)
+  float exhaustCoreTempC = (exhaustOutletTempC + exhaustInletTempC)
                           /2.0;
   // Average temperature of the intake side of the core
-  float intakeCoreTemp  = (intakeInletTempC + intakeOutletTempC)
+  float intakeCoreTempC  = (intakeInletTempC + intakeOutletTempC)
                           /2.0;
   // Average core temperature
-  float coreTemp = (exhaustCoreTemp + intakeCoreTemp)
+  float coreTempC = (exhaustCoreTempC + intakeCoreTempC)
                           /2.0;
 
   // Is cooling air available? If the intake has been off, approximate using core temp. 
-  int coolAvailableIntake = intakeOnPrev ? intakeOutletTempC < COOL_TEMP_C : coreTemp < COOL_TEMP_C;
+  int coolAvailableIntake = intakeOnPrev ? intakeOutletTempC < COOL_TEMP_C : coreTempC < COOL_TEMP_C;
   // Is heating air available? ""
-  int heatAvailableIntake = intakeOnPrev ? intakeOutletTempC > HEAT_TEMP_C : coreTemp < HEAT_TEMP_C;
+  int heatAvailableIntake = intakeOnPrev ? intakeOutletTempC > HEAT_TEMP_C : coreTempC < HEAT_TEMP_C;
   // Is the intake air useful for controlling temperature
   int intakeEnableTempControl = (cmdCool && coolAvailableIntake) || (cmdHeat && heatAvailableIntake); 
 
   // Is the exhaust side useful for controlling temperature 
-  int coolAvailableExhaust = exhaustOnPrev ? exhaustCoreTemp < coreTemp : exhaustInletTempC < coreTemp; 
-  int heatAvailableExhaust = exhaustOnPrev ? exhaustCoreTemp > coreTemp : exhaustInletTempC > coreTemp; 
+  int coolAvailableExhaust = exhaustOnPrev ? exhaustCoreTempC < coreTempC : exhaustInletTempC < coreTempC; 
+  int heatAvailableExhaust = exhaustOnPrev ? exhaustCoreTempC > coreTempC : exhaustInletTempC > coreTempC; 
   int exhaustEnableTempControl = (cmdCool && coolAvailableExhaust) || (cmdHeat && heatAvailableExhaust); 
   
   // Try not to melt the core
   int exhaustHot = exhaustOutletTempC > 40;
 
   // Is the core assit feature useful for either warming or cooling the core to assist in heating or cooling? 
-  int coreAssistCoolAvailable = intakeOnPrev ? coreTemp < intakeOutletTempC : 0;
-  int coreAssistHeatAvailable = intakeOnPrev ? coreTemp > intakeOutletTempC : 0;
+  int coreAssistCoolAvailable = intakeOnPrev && exhaustOnPrev ? exhaustCoreTempC < intakeOutletTempC : 0;
+  int coreAssistHeatAvailable = intakeOnPrev && exhaustOnPrev ? exhaustCoreTempC > intakeOutletTempC : 0;
   int coreAssistAvailable = (cmdCool && coreAssistCoolAvailable) || (cmdHeat && coreAssistHeatAvailable);
-  int bypassAvailable = (cmdCool && coolAvailableIntake) || (cmdHeat && heatAvailableIntake); 
+
+  // Bypass is available whenever the intake inlet is cool or warm enough. 
+  int coolAvailableIntakeInlet = intakeInletTempC < COOL_TEMP_C; 
+  int heatAvailableIntakeInlet = intakeInletTempC < HEAT_TEMP_C; 
+  int bypassAvailable = (cmdCool && coolAvailableIntakeInlet) || (cmdHeat && heatAvailableIntakeInlet); 
 
   temperatureLock.release(); 
 
