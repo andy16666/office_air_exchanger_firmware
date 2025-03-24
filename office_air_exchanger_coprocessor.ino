@@ -48,7 +48,7 @@ Thread temperatureThread;
 #define BYPASS_PWM 12
 #define CORE_ASSIST_PWM 13
 
-const float TARGET_TEMP_C = 19.0; // TODO: Make this an input from HK. 
+const float TARGET_TEMP_C = 20.0; // TODO: Make this an input from HK. 
 // Target air strem temp for cooling 
 const float COOL_TEMP_C = TARGET_TEMP_C - 2.0; 
 // Target air stream temp for heating
@@ -239,9 +239,17 @@ void recomputeMotorStates() {
   int coreHot = exhaustOutletTempC > 40 || exhaustInletTempC > 40;
 
   // Is the core assit feature useful for either warming or cooling the core to assist in heating or cooling? 
-  int coreAssistCoolAvailable = intakeOnPrev && exhaustOnPrev ? coreTempC < intakeOutletTempC : 0;
-  int coreAssistHeatAvailable = intakeOnPrev && exhaustOnPrev ? coreTempC > intakeOutletTempC : 0;
-  int coreAssistAvailable = (cmdCool && coreAssistCoolAvailable) || (cmdHeat && coreAssistHeatAvailable);
+  int coreAssistCoolAvailable = cmdCool && coreTempC < intakeOutletTempC;
+  int coreAssistHeatAvailable = cmdHeat && coreTempC > intakeOutletTempC;
+  int caAdjust = !cmdCool && !cmdHeat && cmdCo2High;
+  int caAdjustCoolAvailable = caAdjust && TARGET_TEMP_C < intakeOutletTempC - 0.5 && coreTempC < TARGET_TEMP_C - 0.5; 
+  int caAdjustWarmAvailable = caAdjust && TARGET_TEMP_C > intakeOutletTempC + 0.5 && coreTempC > TARGET_TEMP_C + 0.5;
+  int coreAssistAvailable =
+                      coreAssistCoolAvailable
+                   || coreAssistHeatAvailable
+                   || caAdjustCoolAvailable
+                   || caAdjustWarmAvailable; 
+                      
 
   // Bypass is available whenever the intake inlet is cool or warm enough. 
   int coolAvailableIntakeInlet = intakeInletTempC < COOL_TEMP_C; 
@@ -268,7 +276,7 @@ void recomputeMotorStates() {
   exhaustOn =
        cmdExhaust
     // Ignore CO2 high if we are controlling temperature and the exhaust is not helpful. 
-    || (cmdCo2High && (exhaustEnableTempControl || !tempControlEnable))
+    || (cmdCo2High && (exhaustEnableTempControl || !tempControlEnable || !intakeOn))
     || exhaustEnableTempControl
     || coreHot
     ;
