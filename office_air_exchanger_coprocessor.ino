@@ -16,17 +16,16 @@ Thread temperatureThread;
 
 #define INVALID_TEMP NAN
 
-// Input Pins
 #define TEMP_SENSOR_DATA 2
 // Commands the system to attempt to lower the room temperature 
-#define CMD_TEMP_COOL 6
+#define CMD_TEMP_COOL 6 // 25
 // Commands the system to attempt to increase room temperature
-#define CMD_TEMP_HEAT 7
+#define CMD_TEMP_HEAT 7 // 23
 // Request air exchange
-#define CMD_CO2_HIGH 8
+#define CMD_CO2_HIGH 8 // 24
 // Request a negative pressure condition in the room (preventing air from leaving, 
 // for example when a door is opened to another part of the house)
-#define CMD_EXHAUST 9
+#define CMD_EXHAUST 9 // 22
 
 // Sensor Addresses
 #define INTAKE_INLET_TEMP_ADDR 234
@@ -44,7 +43,10 @@ Thread temperatureThread;
 // Diverts air from the outlet to the inlet of the fresh air side, effectively increasing heat transfer from the core. 
 #define CORE_ASSIST_ON 18
 
-#define CORE_ASSIST_PWM 16
+#define INTAKE_PWM 10
+#define EXHAUST_PWM 11
+#define BYPASS_PWM 12
+#define CORE_ASSIST_PWM 13
 
 const float TARGET_TEMP_C = 19.0; // TODO: Make this an input from HK. 
 // Target air strem temp for cooling 
@@ -81,6 +83,8 @@ volatile float exhaustOutletTempC = INVALID_TEMP;
 // Toggled to 1 whenever any input changes
 volatile int inputsChanged = 0; 
 
+char buffer[1024];
+
 void setup() {
   intakeOn = 0;
   exhaustOn = 0;
@@ -103,6 +107,10 @@ void setup() {
   pinMode(EXHAUST_BLOWER_ON, OUTPUT);
   pinMode(BYPASS_BLOWER_ON, OUTPUT);
   pinMode(CORE_ASSIST_ON, OUTPUT);
+
+  pinMode(INTAKE_PWM, OUTPUT);
+  pinMode(EXHAUST_PWM, OUTPUT);
+  pinMode(BYPASS_PWM, OUTPUT);
   pinMode(CORE_ASSIST_PWM, OUTPUT);
 
   Serial.begin(9600);
@@ -233,7 +241,7 @@ void recomputeMotorStates() {
 
   // Bypass is available whenever the intake inlet is cool or warm enough. 
   int coolAvailableIntakeInlet = intakeInletTempC < COOL_TEMP_C; 
-  int heatAvailableIntakeInlet = intakeInletTempC < HEAT_TEMP_C; 
+  int heatAvailableIntakeInlet = intakeInletTempC > HEAT_TEMP_C; 
   int bypassAvailable = (cmdCool && coolAvailableIntakeInlet) || (cmdHeat && heatAvailableIntakeInlet); 
 
   temperatureLock.release(); 
@@ -282,49 +290,48 @@ void updateMotorStates()
 
 void updateDisplay() 
 {
-  char* buffer = (char*)malloc(1024 * sizeof(char));
-  
-  sprintf(buffer, "BIECaCHcE       ");
-  lcd.setCursor(0, 0);
-  lcd.print(buffer);
-  sprintf(buffer,
-          "%1d%1d%1d%1d %1d%1d%1d%1d      ",
-          bypassOn ? 1 : 0,
-          intakeOn ? 1 : 0,
-          exhaustOn ? 1 : 0,
-          coreAssistOn ? 1 : 0,
-          cmdCool ? 1 : 0,
-          cmdHeat ? 1 : 0,
-          cmdCo2High ? 1 : 0,
-          cmdExhaust ? 1 : 0,
-          exhaustInletTempC,
-          exhaustOutletTempC);
-  lcd.setCursor(0, 1);
-  lcd.print(buffer);
-  rtos::ThisThread::sleep_for(5000);
-  
-  temperatureLock.acquire(); 
-  sprintf(buffer,
-          "I%2.3f>%2.3f  ",
-          intakeInletTempC,
-          intakeOutletTempC);
-  temperatureLock.release(); 
-  lcd.setCursor(0, 0);
-  lcd.print(buffer);
+  for (int i = 0; i < 8; i++)
+  {
+    if (((i+1) % 4) == 0)
+    {
+      sprintf(buffer,
+            "I % 3.1f<-% 3.1f  ",
+            intakeOutletTempC,
+            intakeInletTempC);
+      lcd.setCursor(0, 0);
+      lcd.print(buffer);
+    }
+    else 
+    {
+      sprintf(buffer,
+              "E % 3.1f->% 3.1f  ",
+              exhaustInletTempC,
+              exhaustOutletTempC);
+      lcd.setCursor(0, 0);
+      lcd.print(buffer);
+    }
 
-  temperatureLock.acquire(); 
-  sprintf(buffer,
-          "E%2.3f>%2.3f  ",
-          exhaustInletTempC,
-          exhaustOutletTempC);
-  temperatureLock.release(); 
+    sprintf(buffer,
+            "%1s%1s%1s%1s%1s  %1s%1s%1s%1s%1s   %1s",
+            intakeOn     ? "I" : "i",
+            exhaustOn    ? "E" : "e",
+            bypassOn     ? "B" : "b",
+            coreAssistOn ? "C" : "c",
+            motorStatesDirty() ? "*" : " ",
 
-  lcd.setCursor(0, 1);
-  lcd.print(buffer);
 
-  free(buffer);
-  
-  digitalWrite(CORE_ASSIST_PWM, coreAssistOn ? LOW : HIGH);
+            cmdCool      ? "C" : "c",
+            cmdHeat      ? "H" : "h",
+            cmdCo2High   ? "V" : "v",
+            cmdExhaust   ? "E" : "e",
+            inputsChanged ? "*" : " ",
+
+            ((i+1) % 2) == 0 ? "." : " "
+    );
+    lcd.setCursor(0, 1);
+    lcd.print(buffer);
+    rtos::ThisThread::sleep_for(1000);
+  }
 }
 
 /* ISR - Any homekit switch change */
@@ -341,11 +348,19 @@ void reReadInputs()
   cmdExhaust = digitalRead(CMD_EXHAUST) == HIGH;   // Active High  
 }
 
-
+int motorStatesDirty()
+{
+  return 
+           intakeOn     != intakeOnPrev
+        || exhaustOn    != exhaustOnPrev
+        || bypassOn     != bypassOnPrev
+        || coreAssistOn != coreAssistOnPrev;
+}
 
 /* Computes the states the motors should be in and updates them. Runs every 60 seconds unless inputsChanged is toggled. */
 void motorThreadImpl() 
 {
+  int delayMotorStateChangeSeconds = 0;
   for (;;) 
   {
     if (inputsChanged)
@@ -359,24 +374,23 @@ void motorThreadImpl()
         recomputeMotorStates();
       } 
       while (inputsChanged); 
+    }
 
-      int motorStatesChanged =
-           intakeOn != intakeOnPrev
-        || exhaustOn != exhaustOnPrev
-        || bypassOn != bypassOnPrev
-        || coreAssistOn != coreAssistOnPrev;
-
-      if (motorStatesChanged) 
+    if (motorStatesDirty())
+    {
+      if (delayMotorStateChangeSeconds <= 0) 
       {
         updateMotorStates();
+        delayMotorStateChangeSeconds = 30; 
       } 
     }
 
-    // Wait 60 seconds or until inputs change. 
-    for (int i = 0; i < 60 && !inputsChanged; i++)
+    rtos::ThisThread::sleep_for(1000);
+
+    if (delayMotorStateChangeSeconds > 0)
     {
-      rtos::ThisThread::sleep_for(1000);
-    }
+      delayMotorStateChangeSeconds--;
+    } 
   }
 }
 
@@ -405,7 +419,6 @@ void displayThreadImpl()
 {
   for (;;) {
     updateDisplay();
-    rtos::ThisThread::sleep_for(5000);
   }
 }
 
