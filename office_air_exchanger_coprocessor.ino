@@ -64,6 +64,8 @@ volatile int exhaustOn;
 volatile int coreAssistOn;
 volatile int bypassOn;
 
+volatile int bypassPWM = 0; 
+
 // Current motor states
 volatile int intakeOnPrev = 0;
 volatile int exhaustOnPrev = 0;
@@ -210,19 +212,21 @@ void recomputeMotorStates() {
   int tempControlEnable = cmdHeat || cmdCool; 
 
   // Average temperature of the exhaust side of the core
-  float exhaustCoreTempC = (exhaustOutletTempC + exhaustInletTempC)
+  float exhaustAvgTempC = (exhaustOutletTempC + exhaustInletTempC)
                           /2.0;
+  float exhaustCoreTempC = exhaustOnPrev ? exhaustOutletTempC : exhaustAvgTempC;
+
   // Average temperature of the intake side of the core
-  float intakeCoreTempC  = (intakeInletTempC + intakeOutletTempC)
-                          /2.0;
-  // Average core temperature
-  float coreTempC = (exhaustCoreTempC + intakeCoreTempC)
+  float intakeAvgTempC  = (intakeInletTempC + intakeOutletTempC)
                           /2.0;
 
+  // Average core temperature
+  float coreTempC = exhaustCoreTempC;
+
   // Is cooling air available? If the intake has been off, approximate using core temp. 
-  int coolAvailableIntake = intakeOnPrev ? intakeOutletTempC < COOL_TEMP_C : coreTempC < COOL_TEMP_C;
+  int coolAvailableIntake = intakeOnPrev || coreAssistOnPrev ? intakeOutletTempC < COOL_TEMP_C : 0;
   // Is heating air available? ""
-  int heatAvailableIntake = intakeOnPrev ? intakeOutletTempC > HEAT_TEMP_C : coreTempC < HEAT_TEMP_C;
+  int heatAvailableIntake = intakeOnPrev || coreAssistOnPrev ? intakeOutletTempC > HEAT_TEMP_C : 0;
   // Is the intake air useful for controlling temperature
   int intakeEnableTempControl = (cmdCool && coolAvailableIntake) || (cmdHeat && heatAvailableIntake); 
 
@@ -232,11 +236,11 @@ void recomputeMotorStates() {
   int exhaustEnableTempControl = (cmdCool && coolAvailableExhaust) || (cmdHeat && heatAvailableExhaust); 
   
   // Try not to melt the core
-  int exhaustHot = exhaustOutletTempC > 40;
+  int coreHot = exhaustOutletTempC > 40 || exhaustInletTempC > 40;
 
   // Is the core assit feature useful for either warming or cooling the core to assist in heating or cooling? 
-  int coreAssistCoolAvailable = intakeOnPrev && exhaustOnPrev ? exhaustCoreTempC < intakeOutletTempC : 0;
-  int coreAssistHeatAvailable = intakeOnPrev && exhaustOnPrev ? exhaustCoreTempC > intakeOutletTempC : 0;
+  int coreAssistCoolAvailable = intakeOnPrev && exhaustOnPrev ? coreTempC < intakeOutletTempC : 0;
+  int coreAssistHeatAvailable = intakeOnPrev && exhaustOnPrev ? coreTempC > intakeOutletTempC : 0;
   int coreAssistAvailable = (cmdCool && coreAssistCoolAvailable) || (cmdHeat && coreAssistHeatAvailable);
 
   // Bypass is available whenever the intake inlet is cool or warm enough. 
@@ -244,28 +248,33 @@ void recomputeMotorStates() {
   int heatAvailableIntakeInlet = intakeInletTempC > HEAT_TEMP_C; 
   int bypassAvailable = (cmdCool && coolAvailableIntakeInlet) || (cmdHeat && heatAvailableIntakeInlet); 
 
+  /*int bypassPWM = bypassAvailable ? 255 : cmdCool || cmdHeat 
+    ? (
+      cmdCool ? 
+    ) 
+    : 0;*/
+
   temperatureLock.release(); 
 
   intakeOn =
-    !cmdExhaust
-    && (
-           cmdCo2High
-        || intakeEnableTempControl
+       !cmdExhaust
+    && ( 
+         (cmdCo2High && (intakeEnableTempControl || !tempControlEnable ))
+      || intakeEnableTempControl
     )
+    || coreHot
     ;
 
   exhaustOn =
-    cmdExhaust
+       cmdExhaust
     // Ignore CO2 high if we are controlling temperature and the exhaust is not helpful. 
     || (cmdCo2High && (exhaustEnableTempControl || !tempControlEnable))
-    || exhaustHot
     || exhaustEnableTempControl
+    || coreHot
     ;
 
-  // Never risk push air backward through the intake 
   coreAssistOn =
-       intakeOn
-    && coreAssistAvailable
+    coreAssistAvailable
     ;
 
   bypassOn =
@@ -292,10 +301,10 @@ void updateDisplay()
 {
   for (int i = 0; i < 8; i++)
   {
-    if (((i+1) % 4) == 0)
+    if (i < 4)
     {
       sprintf(buffer,
-            "I % 3.1f<-% 3.1f  ",
+            "I %5.1f <= %5.1f",
             intakeOutletTempC,
             intakeInletTempC);
       lcd.setCursor(0, 0);
@@ -304,7 +313,7 @@ void updateDisplay()
     else 
     {
       sprintf(buffer,
-              "E % 3.1f->% 3.1f  ",
+              "E %5.1f => %5.1f",
               exhaustInletTempC,
               exhaustOutletTempC);
       lcd.setCursor(0, 0);
