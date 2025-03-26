@@ -1,4 +1,4 @@
-
+#include "MBED_RP2040_PWM.h"
 #include <LiquidCrystal_I2C.h>
 #include <DS18B20.h>
 #include <mbed.h>
@@ -13,6 +13,9 @@ Semaphore temperatureLock(1);
 Thread motorThread; 
 Thread displayThread;
 Thread temperatureThread;  
+
+#define PWM_FREQUENCY 25000
+#define PWM_MIN_DUTY_CYCLE 5.0 
 
 #define INVALID_TEMP NAN
 
@@ -48,11 +51,12 @@ Thread temperatureThread;
 #define BYPASS_PWM 12
 #define CORE_ASSIST_PWM 13
 
+const float TEMP_ADJUST_TOLERANCE = 2.0; 
 const float TARGET_TEMP_C = 20.0; // TODO: Make this an input from HK. 
 // Target air strem temp for cooling 
-const float COOL_TEMP_C = TARGET_TEMP_C - 2.0; 
+const float COOL_TEMP_C = TARGET_TEMP_C - TEMP_ADJUST_TOLERANCE; 
 // Target air stream temp for heating
-const float HEAT_TEMP_C = TARGET_TEMP_C + 2.0; 
+const float HEAT_TEMP_C = TARGET_TEMP_C + TEMP_ADJUST_TOLERANCE; 
 
 DS18B20 ds(TEMP_SENSOR_DATA);
 
@@ -64,7 +68,10 @@ volatile int exhaustOn;
 volatile int coreAssistOn;
 volatile int bypassOn;
 
-volatile int bypassPWM = 0; 
+volatile float intakePWM = 0; 
+volatile float exhaustPWM = 0; 
+volatile float bypassPWM = 0; 
+volatile float coreAssistPWM = 0; 
 
 // Current motor states
 volatile int intakeOnPrev = 0;
@@ -81,6 +88,8 @@ volatile float intakeInletTempC = INVALID_TEMP;
 volatile float intakeOutletTempC = INVALID_TEMP; 
 volatile float exhaustInletTempC = INVALID_TEMP; 
 volatile float exhaustOutletTempC = INVALID_TEMP; 
+
+mbed::PwmOut* pwm[]    = { NULL, NULL, NULL, NULL };
 
 // Toggled to 1 whenever any input changes
 volatile int inputsChanged = 0; 
@@ -114,7 +123,7 @@ void setup() {
   pinMode(EXHAUST_PWM, OUTPUT);
   pinMode(BYPASS_PWM, OUTPUT);
   pinMode(CORE_ASSIST_PWM, OUTPUT);
-
+  
   Serial.begin(9600);
   Serial.print("Devices: ");
   Serial.println(ds.getNumberOfDevices());
@@ -124,15 +133,13 @@ void setup() {
     lcd = LiquidCrystal_I2C(0x3F, 16, 2);
   }
   lcd.init();           // LCD driver initialization
-  lcd.backlight();      // Open the backlight
-  lcd.setCursor(0, 0);  // Move the cursor to row 0, column 0
+  lcd.backlight();      
   lcd.setCursor(0, 0);
   lcd.print("Starting Up");
   digitalWrite(INTAKE_BLOWER_ON, LOW);
   digitalWrite(EXHAUST_BLOWER_ON, LOW);
   digitalWrite(BYPASS_BLOWER_ON, LOW);
   digitalWrite(CORE_ASSIST_ON, LOW);
-  digitalWrite(CORE_ASSIST_PWM, LOW);
   delay(1000);
   lcd.setCursor(0, 0);
   lcd.print("Starting Up.");
@@ -141,7 +148,6 @@ void setup() {
   digitalWrite(EXHAUST_BLOWER_ON, HIGH);
   digitalWrite(BYPASS_BLOWER_ON, HIGH);
   digitalWrite(CORE_ASSIST_ON, HIGH);
-  digitalWrite(CORE_ASSIST_PWM, HIGH);
   lcd.setCursor(0, 0);
   lcd.print("Starting Up..");
   delay(1000);
@@ -206,7 +212,40 @@ void updateTemperature(int requestedAddress, int* address, float* tempC, int nSe
   }
 }
 
-void recomputeMotorStates() {
+uint8_t extrapolatePWM(float gapC, float rangeC, float minGapC, float pwmMin)
+{
+  if (gapC >= rangeC)
+    return 100.0; 
+  
+  if (gapC <= minGapC)  
+      return 0; 
+
+  float powerLevel = (gapC - minGapC) / (rangeC - minGapC); 
+
+  return ((100.0 - pwmMin) * powerLevel) + pwmMin;
+}
+
+
+int computeGradientAvailability(float sourceTempC, float targetTempC, float toleranceC, int heat)
+{ 
+  float availableGradientC = sourceTempC - targetTempC; 
+  float availableAmountC = fabs(availableGradientC);
+
+  int available = (heat ? availableGradientC > 0 : availableGradientC < 0);
+
+  return (available && availableAmountC > toleranceC) ? 1 : 0; 
+}
+
+float computeGradientC(float sourceTempC, float targetTempC, float toleranceC)
+{ 
+  float availableGradientC = sourceTempC - targetTempC; 
+  float availableAmountC = fabs(availableGradientC);
+
+  return (availableAmountC > toleranceC) ? availableAmountC : 0.0; 
+}
+
+void recomputeMotorStates() 
+{
   temperatureLock.acquire(); 
   // Are we heating or cooling? 
   int tempControlEnable = cmdHeat || cmdCool; 
@@ -223,72 +262,73 @@ void recomputeMotorStates() {
   // Average core temperature
   float coreTempC = exhaustCoreTempC;
 
-  // Is cooling air available? If the intake has been off, approximate using core temp. 
-  int coolAvailableIntake = intakeOnPrev || coreAssistOnPrev ? intakeOutletTempC < COOL_TEMP_C : 0;
-  // Is heating air available? ""
-  int heatAvailableIntake = intakeOnPrev || coreAssistOnPrev ? intakeOutletTempC > HEAT_TEMP_C : 0;
-  // Is the intake air useful for controlling temperature
-  int intakeEnableTempControl = (cmdCool && coolAvailableIntake) || (cmdHeat && heatAvailableIntake); 
+  float approxRoomTempC = exhaustInletTempC; 
 
-  // Is the exhaust side useful for controlling temperature 
-  int coolAvailableExhaust = exhaustOnPrev ? exhaustCoreTempC < coreTempC : exhaustInletTempC < coreTempC; 
-  int heatAvailableExhaust = exhaustOnPrev ? exhaustCoreTempC > coreTempC : exhaustInletTempC > coreTempC; 
-  int exhaustEnableTempControl = (cmdCool && coolAvailableExhaust) || (cmdHeat && heatAvailableExhaust); 
-  
-  // Try not to melt the core
+  float tcCaTolerance = tempControlEnable ? TEMP_ADJUST_TOLERANCE : 0.1;
+
+    // Try not to melt the core
   int coreHot = exhaustOutletTempC > 40 || exhaustInletTempC > 40;
 
+  int caAdjustCool = intakeOutletTempC > TARGET_TEMP_C;
+  int caAdjustHeat = intakeOutletTempC < TARGET_TEMP_C;
+
+  // Is the intake air useful for controlling temperature
+  int intakeEnableTempControl = 
+        computeGradientAvailability(intakeOutletTempC, TARGET_TEMP_C, 0.1, intakeOutletTempC >= TARGET_TEMP_C);
+  float intakeTempControlAmountC = computeGradientC(
+      intakeOutletTempC,
+      TARGET_TEMP_C,  
+      0.1);
+
+  float caAvailableAmountC = computeGradientC(coreTempC, intakeOutletTempC, 0.1);
   // Is the core assit feature useful for either warming or cooling the core to assist in heating or cooling? 
-  int coreAssistCoolAvailable = cmdCool && coreTempC < intakeOutletTempC;
-  int coreAssistHeatAvailable = cmdHeat && coreTempC > intakeOutletTempC;
-  int caAdjust = !cmdCool && !cmdHeat && cmdCo2High;
-  int caAdjustCoolAvailable = caAdjust && TARGET_TEMP_C < intakeOutletTempC - 0.5 && coreTempC < TARGET_TEMP_C - 0.5; 
-  int caAdjustWarmAvailable = caAdjust && TARGET_TEMP_C > intakeOutletTempC + 0.5 && coreTempC > TARGET_TEMP_C + 0.5;
-  int coreAssistAvailable =
-                      coreAssistCoolAvailable
-                   || coreAssistHeatAvailable
-                   || caAdjustCoolAvailable
-                   || caAdjustWarmAvailable; 
-                      
+  int caGradientAvailable  = computeGradientAvailability(coreTempC, intakeOutletTempC, 0.1, intakeOutletTempC < TARGET_TEMP_C);
+
+  // Is the exhaust side useful for controlling temperature 
+  int exhaustEnableTempControl = 
+         computeGradientAvailability(exhaustInletTempC, coreTempC, 0.25, coreTempC < intakeOutletTempC);
+  float exhaustTempControlAmountC = computeGradientC(
+      exhaustInletTempC, 
+      coreTempC, 
+      0.1);
 
   // Bypass is available whenever the intake inlet is cool or warm enough. 
-  int coolAvailableIntakeInlet = intakeInletTempC < COOL_TEMP_C; 
-  int heatAvailableIntakeInlet = intakeInletTempC > HEAT_TEMP_C; 
-  int bypassAvailable = (cmdCool && coolAvailableIntakeInlet) || (cmdHeat && heatAvailableIntakeInlet); 
-
-  /*int bypassPWM = bypassAvailable ? 255 : cmdCool || cmdHeat 
-    ? (
-      cmdCool ? 
-    ) 
-    : 0;*/
+  int bypassGradientAvailable = computeGradientAvailability(intakeInletTempC, TARGET_TEMP_C, TEMP_ADJUST_TOLERANCE, cmdHeat && !cmdCool);
+  int bypassAvailable = (tempControlEnable && bypassGradientAvailable) || (!tempControlEnable && cmdCo2High && !bypassGradientAvailable); 
+  float bypassAmountC = computeGradientC(
+      intakeInletTempC, 
+      TARGET_TEMP_C, 
+      0.1);
 
   temperatureLock.release(); 
 
-  intakeOn =
-       !cmdExhaust
-    && ( 
-         (cmdCo2High && (intakeEnableTempControl || !tempControlEnable ))
-      || intakeEnableTempControl
-    )
-    || coreHot
-    ;
+  int bypassEnable = !cmdExhaust && bypassAvailable;
 
-  exhaustOn =
-       cmdExhaust
-    // Ignore CO2 high if we are controlling temperature and the exhaust is not helpful. 
-    || (cmdCo2High && (exhaustEnableTempControl || !tempControlEnable || !intakeOn))
-    || exhaustEnableTempControl
-    || coreHot
-    ;
+  
+  bypassPWM     = bypassEnable    ? extrapolatePWM(bypassAmountC,             10,   0.25, PWM_MIN_DUTY_CYCLE) : 0;
+  exhaustPWM    = cmdExhaust || cmdCo2High || exhaustEnableTempControl || coreHot
+      ? 
+      ( coreHot || cmdExhaust
+        ? 100.0 
+        : exhaustEnableTempControl * extrapolatePWM(exhaustTempControlAmountC, 3,   0, PWM_MIN_DUTY_CYCLE) * 0.8 + cmdCo2High * 40.0 + cmdExhaust * 100.0
+      ) 
+      : 0;
+  intakePWM     = !cmdExhaust && (cmdCo2High || intakeEnableTempControl)    
+      ? intakeEnableTempControl * extrapolatePWM(intakeTempControlAmountC,  3,   0, PWM_MIN_DUTY_CYCLE) * 0.8 + cmdCo2High * 80.0
+      : 0;
 
-  coreAssistOn =
-    coreAssistAvailable
-    ;
+  coreAssistPWM = caGradientAvailable  ? extrapolatePWM(caAvailableAmountC,        3,    0.01, PWM_MIN_DUTY_CYCLE) : 0;
 
-  bypassOn =
-       !cmdExhaust
-    && bypassAvailable
-    ;
+
+  // Motors
+  coreAssistOn = coreAssistPWM >= 99;
+  exhaustOn    = exhaustPWM    >= 100;
+  bypassOn     = bypassPWM     >= 99;
+  intakeOn     = intakePWM     >= 100;
+
+  exhaustPWM = exhaustPWM > 100 ? 100 : exhaustPWM; 
+  intakePWM = intakePWM > 100 ? 100 : intakePWM;
+
 }
 
 void updateMotorStates() 
@@ -329,13 +369,16 @@ void updateDisplay()
     }
 
     sprintf(buffer,
-            "%1s%1s%1s%1s%1s  %1s%1s%1s%1s%1s   %1s",
+            "%1s%1d%1s%1d%1s%1d%1s%1d%1s %1s%1s%1s%1s%1s ",
             intakeOn     ? "I" : "i",
+            (int)(intakePWM    /11.1),
             exhaustOn    ? "E" : "e",
+            (int)(exhaustPWM   /11.1),
             bypassOn     ? "B" : "b",
+            (int)(bypassPWM    /11.1),
             coreAssistOn ? "C" : "c",
+            (int)(coreAssistPWM/11.1),
             motorStatesDirty() ? "*" : " ",
-
 
             cmdCool      ? "C" : "c",
             cmdHeat      ? "H" : "h",
@@ -389,6 +432,10 @@ void motorThreadImpl()
         inputsChanged = 0; 
         reReadInputs(); 
         recomputeMotorStates();
+        setPWM(pwm[0], INTAKE_PWM, PWM_FREQUENCY, (float)intakePWM);
+        setPWM(pwm[1], EXHAUST_PWM, PWM_FREQUENCY, (float)exhaustPWM);
+        setPWM(pwm[2], CORE_ASSIST_PWM, PWM_FREQUENCY, (float)coreAssistPWM);
+        setPWM(pwm[3], BYPASS_PWM, PWM_FREQUENCY, (float)bypassPWM);
       } 
       while (inputsChanged); 
     }
@@ -398,7 +445,7 @@ void motorThreadImpl()
       if (delayMotorStateChangeSeconds <= 0) 
       {
         updateMotorStates();
-        delayMotorStateChangeSeconds = 30; 
+        delayMotorStateChangeSeconds = 15; 
       } 
     }
 
