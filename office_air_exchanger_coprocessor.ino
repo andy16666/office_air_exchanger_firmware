@@ -15,20 +15,22 @@ Thread displayThread;
 Thread temperatureThread;  
 
 #define PWM_FREQUENCY 25000
-#define PWM_MIN_DUTY_CYCLE 5.0 
+#define PWM_MIN_DUTY_CYCLE 10.0 
 
 #define INVALID_TEMP NAN
 
 #define TEMP_SENSOR_DATA 2
 // Commands the system to attempt to lower the room temperature 
 #define CMD_TEMP_COOL 6 // 25
-// Commands the system to attempt to increase room temperature
-#define CMD_TEMP_HEAT 7 // 23
+
+#define CMD_SILENT 7 // 23
 // Request air exchange
 #define CMD_CO2_HIGH 8 // 24
 // Request a negative pressure condition in the room (preventing air from leaving, 
 // for example when a door is opened to another part of the house)
 #define CMD_EXHAUST 9 // 22
+
+//pin_size_t commandPins[] = {CMD_TEMP_COOL, CMD_SILENT, CMD_CO2_HIGH, CMD_EXHAUST}; 
 
 // Sensor Addresses
 #define INTAKE_INLET_TEMP_ADDR 234
@@ -46,10 +48,15 @@ Thread temperatureThread;
 // Diverts air from the outlet to the inlet of the fresh air side, effectively increasing heat transfer from the core. 
 #define CORE_ASSIST_ON 18
 
+//pin_size_t relayPins[] = {INTAKE_BLOWER_ON, EXHAUST_BLOWER_ON, BYPASS_BLOWER_ON, CORE_ASSIST_ON}; 
+
 #define INTAKE_PWM 10
 #define EXHAUST_PWM 11
 #define BYPASS_PWM 12
 #define CORE_ASSIST_PWM 13
+
+//pin_size_t pwmPins[] = {INTAKE_PWM, EXHAUST_PWM, BYPASS_PWM, CORE_ASSIST_PWM}; 
+mbed::PwmOut* pwm[]    = { NULL, NULL, NULL, NULL };
 
 const float TEMP_ADJUST_TOLERANCE = 2.0; 
 const float TARGET_TEMP_C = 20.0; // TODO: Make this an input from HK. 
@@ -80,8 +87,8 @@ volatile int bypassOnPrev = 0;
 volatile int coreAssistOnPrev = 0;
 
 volatile int cmdCool    = 0; 
-volatile int cmdHeat    = 0; 
-volatile int cmdCo2High = 0; 
+volatile int cmdSilent    = 0; 
+volatile int cmdVentilate = 0; 
 volatile int cmdExhaust = 0; 
 
 volatile float intakeInletTempC = INVALID_TEMP; 
@@ -89,12 +96,14 @@ volatile float intakeOutletTempC = INVALID_TEMP;
 volatile float exhaustInletTempC = INVALID_TEMP; 
 volatile float exhaustOutletTempC = INVALID_TEMP; 
 
-mbed::PwmOut* pwm[]    = { NULL, NULL, NULL, NULL };
+
 
 // Toggled to 1 whenever any input changes
 volatile int inputsChanged = 0; 
 
-char buffer[1024];
+char printBuffer[1024];
+
+
 
 void setup() {
   intakeOn = 0;
@@ -104,13 +113,13 @@ void setup() {
 
   // Commands from homebridge/homekit automations
   pinMode(CMD_TEMP_COOL, INPUT_PULLDOWN);
-  pinMode(CMD_TEMP_HEAT, INPUT_PULLDOWN);
+  pinMode(CMD_SILENT, INPUT_PULLDOWN);
   pinMode(CMD_CO2_HIGH, INPUT_PULLDOWN);
   pinMode(CMD_EXHAUST, INPUT_PULLDOWN);
 
   // Inputs from HK are interrupt driven to make the system instantly respond to changes. 
   attachInterrupt(digitalPinToInterrupt(CMD_TEMP_COOL), handleInputChange, CHANGE);
-  attachInterrupt(digitalPinToInterrupt(CMD_TEMP_HEAT), handleInputChange, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(CMD_SILENT), handleInputChange, CHANGE);
   attachInterrupt(digitalPinToInterrupt(CMD_CO2_HIGH),  handleInputChange, CHANGE);
   attachInterrupt(digitalPinToInterrupt(CMD_EXHAUST), handleInputChange, CHANGE);
 
@@ -222,7 +231,8 @@ uint8_t extrapolatePWM(float gapC, float rangeC, float minGapC, float pwmMin)
 
   float powerLevel = (gapC - minGapC) / (rangeC - minGapC); 
 
-  return ((100.0 - pwmMin) * powerLevel) + pwmMin;
+  float pwmDutyCycle = powerLevel * 100.0;
+  return pwmDutyCycle > pwmMin ? pwmDutyCycle : pwmMin;
 }
 
 
@@ -244,22 +254,62 @@ float computeGradientC(float sourceTempC, float targetTempC, float toleranceC)
   return (availableAmountC > toleranceC) ? availableAmountC : 0.0; 
 }
 
+float clamp(float value, float min, float max)
+{
+  if (value > max)
+    return max; 
+  if (value < min)
+    return min; 
+  
+  return value; 
+}
+
+/*
+  Move the two fan speeds apart so that they don't make an interference pattern
+*/ 
+void pryApart(volatile float* pwm1, volatile float* pwm2, float minDifference, float maxValue)
+{
+  // If one is off, we don't care. 
+  if (!*pwm1 || !*pwm2)
+    return; 
+
+  float differenceAbs = abs(*pwm1 - *pwm2);
+
+  if (differenceAbs <= minDifference)
+  {
+    float targetDifference = minDifference - differenceAbs;
+    float direction = (*pwm1 >= *pwm2) ? 1 : -1; 
+
+    *pwm1 += direction * targetDifference/2.0;
+    *pwm2 -= direction * targetDifference/2.0; 
+    
+    if (fmax(*pwm1, *pwm2) > maxValue)
+    {
+      float decrease = fmax(*pwm1, *pwm2) - maxValue; 
+
+      *pwm1 -= decrease;
+      *pwm2 -= decrease; 
+    }
+
+    if (fmin(*pwm1, *pwm2) < PWM_MIN_DUTY_CYCLE)
+    {
+      float increase = PWM_MIN_DUTY_CYCLE - fmin(*pwm1, *pwm2); 
+
+      *pwm1 += increase;
+      *pwm2 += increase; 
+    }
+  }
+
+  
+}
+
 void recomputeMotorStates() 
 {
   temperatureLock.acquire(); 
   // Are we heating or cooling? 
-  int tempControlEnable = cmdHeat || cmdCool; 
+  int tempControlEnable = cmdCool; 
 
-  // Average temperature of the exhaust side of the core
-  float exhaustAvgTempC = (exhaustOutletTempC + exhaustInletTempC)
-                          /2.0;
-  float exhaustCoreTempC = exhaustOnPrev ? exhaustOutletTempC : exhaustAvgTempC;
-
-  // Average temperature of the intake side of the core
-  float intakeAvgTempC  = (intakeInletTempC + intakeOutletTempC)
-                          /2.0;
-
-  // Average core temperature
+  float exhaustCoreTempC = exhaustOutletTempC;
   float coreTempC = exhaustCoreTempC;
 
   float approxRoomTempC = exhaustInletTempC; 
@@ -274,62 +324,85 @@ void recomputeMotorStates()
 
   // Is the intake air useful for controlling temperature
   int intakeEnableTempControl = 
-        computeGradientAvailability(intakeOutletTempC, TARGET_TEMP_C, 0.1, intakeOutletTempC >= TARGET_TEMP_C);
+        computeGradientAvailability(intakeOutletTempC, TARGET_TEMP_C, 0.1, intakeOutletTempC < TARGET_TEMP_C && !cmdCool);
   float intakeTempControlAmountC = computeGradientC(
       intakeOutletTempC,
       TARGET_TEMP_C,  
       0.1);
 
-  float caAvailableAmountC = computeGradientC(coreTempC, intakeOutletTempC, 0.1);
   // Is the core assit feature useful for either warming or cooling the core to assist in heating or cooling? 
-  int caGradientAvailable  = computeGradientAvailability(coreTempC, intakeOutletTempC, 0.1, intakeOutletTempC < TARGET_TEMP_C);
+  float caAvailableAmountC = computeGradientC(coreTempC, intakeOutletTempC, 0.1);
+
+  Serial.print("caAvailableAmountC: ");
+  Serial.println(caAvailableAmountC);
 
   // Is the exhaust side useful for controlling temperature 
   int exhaustEnableTempControl = 
-         computeGradientAvailability(exhaustInletTempC, coreTempC, 0.25, coreTempC < intakeOutletTempC);
+         computeGradientAvailability(exhaustInletTempC, coreTempC, 1.0, coreTempC < TARGET_TEMP_C);
   float exhaustTempControlAmountC = computeGradientC(
       exhaustInletTempC, 
       coreTempC, 
-      0.1);
+      1.0);
 
   // Bypass is available whenever the intake inlet is cool or warm enough. 
-  int bypassGradientAvailable = computeGradientAvailability(intakeInletTempC, TARGET_TEMP_C, TEMP_ADJUST_TOLERANCE, cmdHeat && !cmdCool);
-  int bypassAvailable = (tempControlEnable && bypassGradientAvailable) || (!tempControlEnable && cmdCo2High && !bypassGradientAvailable); 
+  int bypassGradientAvailable = computeGradientAvailability(intakeInletTempC, intakeOutletTempC, TEMP_ADJUST_TOLERANCE, intakeOutletTempC > TARGET_TEMP_C);
+  int bypassAvailable = (tempControlEnable && bypassGradientAvailable) || (!tempControlEnable && cmdVentilate && !bypassGradientAvailable); 
   float bypassAmountC = computeGradientC(
       intakeInletTempC, 
-      TARGET_TEMP_C, 
-      0.1);
+      intakeOutletTempC, 
+      TEMP_ADJUST_TOLERANCE);
 
   temperatureLock.release(); 
 
   int bypassEnable = !cmdExhaust && bypassAvailable;
 
+  coreAssistPWM = extrapolatePWM(caAvailableAmountC, 2, 0.01, PWM_MIN_DUTY_CYCLE) * 2.0;
+  bypassPWM     = bypassEnable * extrapolatePWM(bypassAmountC, TEMP_ADJUST_TOLERANCE, 0.25, PWM_MIN_DUTY_CYCLE)
+
+              + cmdVentilate * extrapolatePWM((1.0/(1.0+caAvailableAmountC)), 1.0, 0.0, PWM_MIN_DUTY_CYCLE)
+              ;
   
-  bypassPWM     = bypassEnable    ? extrapolatePWM(bypassAmountC,             10,   0.25, PWM_MIN_DUTY_CYCLE) : 0;
-  exhaustPWM    = cmdExhaust || cmdCo2High || exhaustEnableTempControl || coreHot
+  exhaustPWM    = cmdExhaust || cmdVentilate || exhaustEnableTempControl || coreHot
+      ?
+        exhaustEnableTempControl * extrapolatePWM(exhaustTempControlAmountC, 3, 0, PWM_MIN_DUTY_CYCLE) 
+        + cmdExhaust * 100.0
+        + coreHot * 100.0
+        + PWM_MIN_DUTY_CYCLE
+      : 0
+      ;
+
+  intakePWM     = !cmdExhaust  
       ? 
-      ( coreHot || cmdExhaust
-        ? 100.0 
-        : exhaustEnableTempControl * extrapolatePWM(exhaustTempControlAmountC, 3,   0, PWM_MIN_DUTY_CYCLE) * 0.8 + cmdCo2High * 40.0 + cmdExhaust * 100.0
-      ) 
-      : 0;
-  intakePWM     = !cmdExhaust && (cmdCo2High || intakeEnableTempControl)    
-      ? intakeEnableTempControl * extrapolatePWM(intakeTempControlAmountC,  3,   0, PWM_MIN_DUTY_CYCLE) * 0.8 + cmdCo2High * 80.0
+          intakeEnableTempControl * extrapolatePWM(intakeTempControlAmountC, 3, 0, PWM_MIN_DUTY_CYCLE) 
+        + bypassPWM
+        + cmdVentilate * 90.0 
+        + coreHot * 100.0
+        + PWM_MIN_DUTY_CYCLE
       : 0;
 
-  coreAssistPWM = caGradientAvailable  ? extrapolatePWM(caAvailableAmountC,        3,    0.01, PWM_MIN_DUTY_CYCLE) : 0;
+  float maxSpeed = cmdSilent ? 80 : 200; 
 
+  exhaustPWM    =  clamp(exhaustPWM,   PWM_MIN_DUTY_CYCLE, maxSpeed); 
+  intakePWM     =  clamp(intakePWM,    PWM_MIN_DUTY_CYCLE, maxSpeed);
+  coreAssistPWM =  clamp(coreAssistPWM, 0, maxSpeed);
+  bypassPWM     =  clamp(bypassPWM,    0, maxSpeed);
 
   // Motors
-  coreAssistOn = coreAssistPWM >= 99;
-  exhaustOn    = exhaustPWM    >= 100;
-  bypassOn     = bypassPWM     >= 99;
   intakeOn     = intakePWM     >= 100;
+  exhaustOn    = exhaustPWM    >= 100;
+  coreAssistOn = coreAssistPWM >= 100;
+  bypassOn     = bypassPWM     >= 100;
+  
+  maxSpeed = cmdSilent ? 80 : 100; 
 
-  exhaustPWM = exhaustPWM > 100 ? 100 : exhaustPWM; 
-  intakePWM = intakePWM > 100 ? 100 : intakePWM;
-
+  exhaustPWM    =  clamp(exhaustPWM,     PWM_MIN_DUTY_CYCLE, maxSpeed); 
+  intakePWM     =  clamp(intakePWM,     PWM_MIN_DUTY_CYCLE, maxSpeed);
+  coreAssistPWM =  clamp(coreAssistPWM, 0, maxSpeed);
+  bypassPWM     =  clamp(bypassPWM,     0, maxSpeed);
+  
+  pryApart(&coreAssistPWM, &bypassPWM, 25.0, maxSpeed); 
 }
+
 
 void updateMotorStates() 
 {
@@ -351,24 +424,24 @@ void updateDisplay()
   {
     if (i < 4)
     {
-      sprintf(buffer,
+      sprintf(printBuffer,
             "I %5.1f <= %5.1f",
             intakeOutletTempC,
             intakeInletTempC);
       lcd.setCursor(0, 0);
-      lcd.print(buffer);
+      lcd.print(printBuffer);
     }
     else 
     {
-      sprintf(buffer,
+      sprintf(printBuffer,
               "E %5.1f => %5.1f",
               exhaustInletTempC,
               exhaustOutletTempC);
       lcd.setCursor(0, 0);
-      lcd.print(buffer);
+      lcd.print(printBuffer);
     }
 
-    sprintf(buffer,
+    sprintf(printBuffer,
             "%1s%1d%1s%1d%1s%1d%1s%1d%1s %1s%1s%1s%1s%1s ",
             intakeOn     ? "I" : "i",
             (int)(intakePWM    /11.1),
@@ -381,15 +454,15 @@ void updateDisplay()
             motorStatesDirty() ? "*" : " ",
 
             cmdCool      ? "C" : "c",
-            cmdHeat      ? "H" : "h",
-            cmdCo2High   ? "V" : "v",
+            cmdSilent      ? "S" : "s",
+            cmdVentilate   ? "V" : "v",
             cmdExhaust   ? "E" : "e",
             inputsChanged ? "*" : " ",
 
             ((i+1) % 2) == 0 ? "." : " "
     );
     lcd.setCursor(0, 1);
-    lcd.print(buffer);
+    lcd.print(printBuffer);
     rtos::ThisThread::sleep_for(1000);
   }
 }
@@ -403,8 +476,8 @@ void handleInputChange()
 void reReadInputs() 
 {
   cmdCool    = digitalRead(CMD_TEMP_COOL) == HIGH;    // Active High
-  cmdHeat    = digitalRead(CMD_TEMP_HEAT) == HIGH;    // Active High
-  cmdCo2High = digitalRead(CMD_CO2_HIGH) == HIGH;  // Active High
+  cmdSilent    = digitalRead(CMD_SILENT) == HIGH;    // Active High
+  cmdVentilate = digitalRead(CMD_CO2_HIGH) == HIGH;  // Active High
   cmdExhaust = digitalRead(CMD_EXHAUST) == HIGH;   // Active High  
 }
 
