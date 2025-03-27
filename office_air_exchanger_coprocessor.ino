@@ -273,7 +273,7 @@ void pryApart(volatile float* pwm1, volatile float* pwm2, float minDifference, f
   if (!*pwm1 || !*pwm2)
     return; 
 
-  float differenceAbs = abs(*pwm1 - *pwm2);
+  float differenceAbs = fabs(*pwm1 - *pwm2);
 
   if (differenceAbs <= minDifference)
   {
