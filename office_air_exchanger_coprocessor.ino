@@ -484,8 +484,9 @@ void recomputeMotorStates()
   int coreHot = TEMPERATURES_C[EXHAUST_OUTLET_IDX] > HOT_TEMP_C || TEMPERATURES_C[EXHAUST_INLET_IDX] > HOT_TEMP_C;
 
   float intakeOutletToTargetTempC      = computeGradientC(TEMPERATURES_C[INTAKE_OUTLET_IDX], targetTempC, 0.1);  
-  float coreToIntakeOutletTempC        = computeGradientC(coreTempC,         TEMPERATURES_C[INTAKE_OUTLET_IDX], 0.1);
+  float coreToIntakeOutletTempC        = computeGradientC(coreTempC,                         TEMPERATURES_C[INTAKE_OUTLET_IDX], 0.1);
   float intakeInletToIntakeOutletTempC = computeGradientC(TEMPERATURES_C[INTAKE_INLET_IDX],  TEMPERATURES_C[INTAKE_OUTLET_IDX], 0.1);
+  float intakeInletToTargetTempC       = computeGradientC(TEMPERATURES_C[INTAKE_INLET_IDX],  targetTempC, 0.1);
 
   float exhaustToCoreTempC        = computeGradientC(TEMPERATURES_C[EXHAUST_INLET_IDX], coreTempC, 0.1);
   float estimatedRoomTempCToTargetTempC = computeGradientC(estimatedRoomTempC, targetTempC, 0.1);
@@ -494,6 +495,10 @@ void recomputeMotorStates()
   float exhaustTempControlAmountC = fmin(intakeOutletToTargetTempC, exhaustToCoreTempC);
 
   float intakeTempControlAmountC   = fmin(estimatedRoomTempCToTargetTempC, intakeOutletToTargetTempC); 
+
+  float bypassTempControlAmountC   = fmin(intakeInletToTargetTempC, intakeOutletToTargetTempC); 
+
+  float coreAssistTempControlAmountC = fmin(coreToIntakeOutletTempC, intakeOutletToTargetTempC);
 
   // Is the intake air useful for controlling temperature
   int intakeEnableTempControl = estimatedRoomTempC > targetTempC  
@@ -532,14 +537,14 @@ void recomputeMotorStates()
       : 0
       ;
 
-  PWM_COMMANDS[CA_IDX]          = coreAssistEnable        ? extrapolatePWM(coreToIntakeOutletTempC,        CORE_TEMP_TOLERANCE_C, 0.1, PWM_MIN_DUTY_CYCLE, maxSpeed) : 0.0;
-  PWM_COMMANDS[BYPASS_IDX]      = bypassEnable            ? extrapolatePWM(intakeInletToIntakeOutletTempC, CORE_TEMP_TOLERANCE_C, 0.1, PWM_MIN_DUTY_CYCLE, maxSpeed) : 0.0;
+  PWM_COMMANDS[CA_IDX]          = coreAssistEnable        ? extrapolatePWM(coreAssistTempControlAmountC,   CORE_TEMP_TOLERANCE_C, 0.1, PWM_MIN_DUTY_CYCLE, maxSpeed) : 0.0;
+  PWM_COMMANDS[BYPASS_IDX]      = bypassEnable            ? extrapolatePWM(bypassTempControlAmountC,       CORE_TEMP_TOLERANCE_C, 0.1, PWM_MIN_DUTY_CYCLE, maxSpeed) : 0.0;
   
   // Always idle the intake and outlet at PWM_MIN_DUTY_CYCLE so we have an accurate temp sample. 
   PWM_COMMANDS[EXHAUST_IDX]     = clamp(PWM_COMMANDS[EXHAUST_IDX    ], PWM_MIN_DUTY_CYCLE, maxSpeed); 
   PWM_COMMANDS[INTAKE_IDX ]     = clamp(PWM_COMMANDS[INTAKE_IDX     ], PWM_MIN_DUTY_CYCLE, maxSpeed);
   PWM_COMMANDS[BYPASS_IDX ]     = clamp(PWM_COMMANDS[BYPASS_IDX     ], 0,                  maxSpeed);
-  PWM_COMMANDS[CA_IDX]          = clamp(PWM_COMMANDS[CA_IDX], 0,                  maxSpeed);
+  PWM_COMMANDS[CA_IDX]          = clamp(PWM_COMMANDS[CA_IDX],          0,                  maxSpeed);
 
   for (int i = 0; i < NUM_BLOWER_PINS; i++)
   {
@@ -550,6 +555,11 @@ void recomputeMotorStates()
   {
     pryApart(&PWM_COMMANDS[CA_IDX], &PWM_COMMANDS[BYPASS_IDX], 25, 80); 
     pryApart(&PWM_COMMANDS[CA_IDX], &PWM_COMMANDS[INTAKE_IDX], 15, 90);
+  }
+  // Safeguard against bypass during CA inversion. 
+  else if (PWM_COMMANDS[CA_IDX] >= 100.0)
+  {
+    PWM_COMMANDS[BYPASS_IDX] = 0; 
   }
 }
 
@@ -650,7 +660,7 @@ void motorThreadImpl()
 
         for (int i = 0; i < NUM_PWM_PINS; i++)
         {
-          setPWM(pwm[0], PWM_PINS[i], PWM_FREQUENCY, (float)PWM_COMMANDS[i]);
+          setPWM(pwm[i], PWM_PINS[i], PWM_FREQUENCY, PWM_COMMANDS[i]);
         }
       } 
       while (inputsChanged); 
