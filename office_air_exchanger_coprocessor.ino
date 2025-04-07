@@ -97,7 +97,7 @@ const float NORM_TEMP_C            = 20;
 const float HOT_TEMP_C             = 35; 
 
 // How closely do we try to control temperatures around the core. 
-const float CORE_TEMP_TOLERANCE_C  = 2.0;
+const float CORE_TEMP_TOLERANCE_C  = 1.0;
 
 // Toggled to 1 whenever any input changes, 
 // either via an ISR, or via temp sensor polling. 
@@ -477,38 +477,40 @@ void recomputeMotorStates()
   float coreTempC = TEMPERATURES_C[EXHAUST_OUTLET_IDX];
 
   // The exhaust idle flow gives us a good sample of room temperature
-  // air, albeit a bit on the warm side.
-  float estimatedRoomTempC = TEMPERATURES_C[EXHAUST_OUTLET_IDX]; 
+  // air, albeit a bit on the warm side if printers are running.
+  float estimatedRoomTempC = TEMPERATURES_C[EXHAUST_INLET_IDX]; 
   
     // Try not to melt the core
   int coreHot = TEMPERATURES_C[EXHAUST_OUTLET_IDX] > HOT_TEMP_C || TEMPERATURES_C[EXHAUST_INLET_IDX] > HOT_TEMP_C;
 
-  float intakeOutletToTargetTempC      = computeGradientC(TEMPERATURES_C[INTAKE_OUTLET_IDX], targetTempC, 0.1);  
-  float coreToIntakeOutletTempC        = computeGradientC(coreTempC,                         TEMPERATURES_C[INTAKE_OUTLET_IDX], 0.1);
-  float intakeInletToIntakeOutletTempC = computeGradientC(TEMPERATURES_C[INTAKE_INLET_IDX],  TEMPERATURES_C[INTAKE_OUTLET_IDX], 0.1);
-  float intakeInletToTargetTempC       = computeGradientC(TEMPERATURES_C[INTAKE_INLET_IDX],  targetTempC, 0.1);
+  float intakeOutletToTargetTempC       = computeGradientC(TEMPERATURES_C[INTAKE_OUTLET_IDX], targetTempC, 0.1);  
+  float coreToIntakeOutletTempC         = computeGradientC(coreTempC,                         TEMPERATURES_C[INTAKE_OUTLET_IDX], 0.1);
+  float intakeInletToIntakeOutletTempC  = computeGradientC(TEMPERATURES_C[INTAKE_INLET_IDX],  TEMPERATURES_C[INTAKE_OUTLET_IDX], 0.1);
+  float intakeInletToTargetTempC        = computeGradientC(TEMPERATURES_C[INTAKE_INLET_IDX],  targetTempC, 0.1);
+  float exhaustToCoreTempC              = computeGradientC(TEMPERATURES_C[EXHAUST_INLET_IDX], coreTempC, 0.1);
+  float estimatedRoomTempCToTargetTempC = computeGradientC(estimatedRoomTempC,                targetTempC, 0.1);
 
-  float exhaustToCoreTempC        = computeGradientC(TEMPERATURES_C[EXHAUST_INLET_IDX], coreTempC, 0.1);
-  float estimatedRoomTempCToTargetTempC = computeGradientC(estimatedRoomTempC, targetTempC, 0.1);
-  
+  // Target the core temp the same distance from the target as the intake outlet is, but opposite. 
+  float targetCoreTempC = TEMPERATURES_C[INTAKE_OUTLET_IDX] > targetTempC
+          ? targetTempC - 2.0 : targetTempC + 2.0;
+
+  float coreTempToTargetCoreTempC       = computeGradientC(coreTempC,                         targetCoreTempC, 0.1);
+
   // Try to position the core between the target temp and the exhaust temp. 
-  float exhaustTempControlAmountC = fmin(intakeOutletToTargetTempC, exhaustToCoreTempC);
-
-  float intakeTempControlAmountC   = fmin(estimatedRoomTempCToTargetTempC, intakeOutletToTargetTempC); 
-
-  float bypassTempControlAmountC   = fmin(intakeInletToTargetTempC, intakeOutletToTargetTempC); 
-
+  float exhaustTempControlAmountC    = coreTempToTargetCoreTempC;
+  float intakeTempControlAmountC     = fmin(estimatedRoomTempCToTargetTempC, intakeOutletToTargetTempC); 
+  float bypassTempControlAmountC     = fmin(intakeInletToTargetTempC, intakeOutletToTargetTempC); 
   float coreAssistTempControlAmountC = fmin(coreToIntakeOutletTempC, intakeOutletToTargetTempC);
+
+  // Is the exhaust side useful for controlling temperature 
+  int exhaustEnableTempControl = TEMPERATURES_C[EXHAUST_INLET_IDX] > coreTempC
+          ? coreTempC < targetCoreTempC
+          : coreTempC > targetCoreTempC;
 
   // Is the intake air useful for controlling temperature
   int intakeEnableTempControl = estimatedRoomTempC > targetTempC  
           ? TEMPERATURES_C[INTAKE_OUTLET_IDX] < estimatedRoomTempC 
           : TEMPERATURES_C[INTAKE_OUTLET_IDX] > estimatedRoomTempC;
-
-  // Is the exhaust side useful for controlling temperature 
-  int exhaustEnableTempControl = TEMPERATURES_C[EXHAUST_INLET_IDX] > TEMPERATURES_C[INTAKE_OUTLET_IDX] 
-          ? TEMPERATURES_C[INTAKE_OUTLET_IDX] < targetTempC 
-          : TEMPERATURES_C[INTAKE_OUTLET_IDX] > targetTempC;
 
   int coreAssistEnable = TEMPERATURES_C[INTAKE_OUTLET_IDX] > targetTempC
           ? coreTempC < TEMPERATURES_C[INTAKE_OUTLET_IDX]
@@ -522,7 +524,7 @@ void recomputeMotorStates()
 
   PWM_COMMANDS[INTAKE_IDX]     = !COMMANDS[CMD_EXHAUST_IDX]
       ? 
-          intakeEnableTempControl * extrapolatePWM(intakeTempControlAmountC, 3, 0, PWM_MIN_DUTY_CYCLE, maxSpeed) 
+          intakeEnableTempControl * extrapolatePWM(intakeTempControlAmountC, CORE_TEMP_TOLERANCE_C, 0, PWM_MIN_DUTY_CYCLE, maxSpeed) 
         + COMMANDS[CMD_VENTILATE_IDX] * maxSpeed
         + COMMANDS[CMD_COOL_IDX] * maxSpeed
         + coreHot * maxSpeed
@@ -531,7 +533,7 @@ void recomputeMotorStates()
 
   PWM_COMMANDS[EXHAUST_IDX]     = COMMANDS[CMD_EXHAUST_IDX] || COMMANDS[CMD_VENTILATE_IDX] || exhaustEnableTempControl || coreHot
       ?
-        exhaustEnableTempControl * extrapolatePWM(exhaustTempControlAmountC, 3, 0, PWM_MIN_DUTY_CYCLE, maxSpeed) 
+        exhaustEnableTempControl * extrapolatePWM(exhaustTempControlAmountC, CORE_TEMP_TOLERANCE_C, 0, PWM_MIN_DUTY_CYCLE, maxSpeed) 
         + COMMANDS[CMD_EXHAUST_IDX] * 100.0
         + coreHot * maxSpeed
       : 0
