@@ -1,36 +1,77 @@
-#include "MBED_RP2040_PWM.h"
-#include <LiquidCrystal_I2C.h>
-#include <DS18B20.h>
-#include <mbed.h>
-#include <rtos.h>
-#include <platform/Callback.h>
 #include <math.h>
 #include <float.h>
+#include <aos.h> 
+#include <LCDPrint.h>
+#include <TemperatureSensors.h> 
+#include <GPIOOutputs.h> 
+#include <PWMFan.h>
+#include <BangProtocol.h> 
+
+/*
+ * This program is free software: you can redistribute it and/or modify it 
+ * under the terms of the GNU General Public License as published by the 
+ * Free Software Foundation, either version 3 of the License, or (at your 
+ * option) any later version.
+ * 
+ * This program is distributed in the hope that it will be useful, but 
+ * WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY 
+ * or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General Public License for 
+ * more details.
+ * 
+ * You should have received a copy of the GNU General Public License along 
+ * with this program. If not, see <https://www.gnu.org/licenses/>.
+ */
+
+ /* 
+  This firmware is designed to run on a Raspberry Pi Pico and uses the MBed 
+  RTos. It's written for a custom HRV/air exchanger which has 4 different control 
+  axes: 
+  - Intake, which applies a pressure gradient from an outside air intake, 
+  across the intake side of the core assembly, to an inside vent. 
+  - Exhaust, which applies a pressure gradient from the inside air across the 
+  exhaust side of the core assembly, to an outside vent. 
+  - Bypass, which applies a pressure gradient around the intake side of the core,
+  bypassing it, bringing outside air directly inside without heat exchange
+  - Core Assist, which increases air velocity through the intake side of the 
+  core assembly in the direction of intake, and also applies a reverse flow 
+  on the bypass axis, which must not exceed the intake pressure gradient. 
+
+  Each axis has an "inlet" and "outlet" side, representing the source and 
+  sink directions from the core. 
+
+  Each axis has one or more PWM fans, Noctua Industrial are recommended, 
+  controlled by the PWM channels via MOSFETS, and at least one mains powered 
+  fan or "blower", which is engaged on the highest PWM level. Intake and Exhaust 
+  blowers are centrifugal turbines, while bypass and core assist are either 
+  axial turbines or large 120V server fans. 
+
+  4 temperature sensors are used: 
+  - Exhaust inlet, which is located anywhere on the room side of the exhaust 
+  air flow path, directly in the air flow. 
+  - Exhaust outlet, which is located very close to the outlet of the heat exchanger, 
+  OR ideally, against the outlet side of the core. This temperature should 
+  closely represent the actual core temperature. 
+  - Intake inlet, which will be very close to the vent which admits outside air to the 
+  system. 
+  - Intake outlet, which should be somewhere in the air stream leaving the intake
+  side, after the bypass air has been re-introduced. It should give an accurate 
+  reading of the resulting temperature after the core air and bypass air are mixed, 
+  which informs the ratio of bypass to core assist used to achieve the target 
+  temperature.
+  */ 
+
+#define HOSTNAME "officeae"
 
 #define INVALID_TEMP FLT_MIN
-
-#define STR_(X) #X
-#define STR(X) STR_(X)
-
-#define LCD_ADDRESS 0x27
-#define LCD_COLS    16
-#define LCD_ROWS     2
 
 #define PWM_FREQUENCY      25000
 #define PWM_MIN_DUTY_CYCLE    10.0 
 #define TEMP_SENSOR_PIN 2
 
-#define INTAKE_INLET_TEMP_ADDR 234
-#define INTAKE_OUTLET_TEMP_ADDR 119
-#define EXHAUST_INLET_TEMP_ADDR 166
-#define EXHAUST_OUTLET_TEMP_ADDR 41
-
-#define NUM_BLOWER_PINS 4
-#define NUM_PWM_PINS 4
-#define INTAKE_IDX 0
-#define EXHAUST_IDX 1
-#define BYPASS_IDX 2
-#define CA_IDX 3
+#define INTAKE_INLET_TEMP_ADDR   234
+#define INTAKE_OUTLET_TEMP_ADDR  119
+#define EXHAUST_INLET_TEMP_ADDR  166
+#define EXHAUST_OUTLET_TEMP_ADDR  41
 
 #define CMD_COOL_IDX      0
 #define CMD_SILENT_IDX    1
@@ -38,21 +79,13 @@
 #define CMD_EXHAUST_IDX   3
 #define NUM_CMD_PINS      4
 
-#define INTAKE_INLET_IDX   0
-#define INTAKE_OUTLET_IDX  1
-#define EXHAUST_INLET_IDX  2
-#define EXHAUST_OUTLET_IDX 3
-#define NUM_SENSORS        4
+#define NUM_PWM_PINS 4
+#define INTAKE_IDX 0
+#define EXHAUST_IDX 1
+#define BYPASS_IDX 2
+#define CA_IDX 3
 
-// Commands the system to attempt to lower the room temperature 
-#define CMD_COOL      6 // GPIO 25 on HB server 
-// Request lowest possible sound pressure levels
-#define CMD_SILENT    7 // GPIO 23 on HB server 
-// Request air exchange
-#define CMD_VENTILATE 8 // GPIO 24 on HB server 
-// Request a negative pressure condition in the room (preventing air from leaving, 
-// for example when a door is opened to another part of the house)
-#define CMD_EXHAUST   9 // GPIO 22 on HB server 
+float PWM_COMMANDS[(NUM_PWM_PINS)]     = {0, 0, 0, 0}; 
 
 // Output Pins
 // Puller on the outlet of the core section
@@ -64,335 +97,144 @@
 // Diverts air from the outlet to the inlet of the fresh air side, effectively increasing heat transfer from the core. 
 #define CORE_ASSIST_BLOWER_ON    18
 
+#define TRANSITION_TIME_MS 5000
 
 #define INTAKE_PWM      10
 #define EXHAUST_PWM     11
 #define BYPASS_PWM      12
 #define CORE_ASSIST_PWM 13
 
-DS18B20 ds(TEMP_SENSOR_PIN);
-LiquidCrystal_I2C lcd(LCD_ADDRESS, LCD_COLS, LCD_ROWS);
+#define PWM_MIN_DUTY_CYCLE    10.0 
 
-const pin_size_t CMD_PINS[(NUM_CMD_PINS)] = {CMD_COOL, CMD_SILENT, CMD_VENTILATE, CMD_EXHAUST}; 
-int   COMMANDS[(NUM_CMD_PINS)] = {0, 0, 0, 0};
+using namespace AOS; 
+using AOS::TemperatureSensors; 
+using AOS::LCDPrint; 
 
-const pin_size_t BLOWER_PINS[(NUM_BLOWER_PINS)]  = {INTAKE_BLOWER_ON, EXHAUST_BLOWER_ON, BYPASS_BLOWER_ON, CORE_ASSIST_BLOWER_ON}; 
-const char*      BLOWER_NAMES[(NUM_BLOWER_PINS)] = {"Intake", "Exhaust", "Bypass", "Core Assist"}; 
-// Intended motor states
-int BLOWER_COMMANDS[(NUM_BLOWER_PINS)] = {0, 0, 0, 0};
-// Current motor states
-int   BLOWER_STATES[(NUM_BLOWER_PINS)] = {0, 0, 0, 0};
-
-const pin_size_t PWM_PINS[(NUM_PWM_PINS)] = {INTAKE_PWM, EXHAUST_PWM, BYPASS_PWM, CORE_ASSIST_PWM}; 
-const char*      PWM_NAMES[(NUM_BLOWER_PINS)] = {"Intake PWM", "Exhaust PWM", "Bypass PWM", "Core Assist PWM"}; 
-float PWM_COMMANDS[(NUM_PWM_PINS)]     = {0, 0, 0, 0}; 
-
-const pin_size_t TEMP_SENSOR_ADDRESSES[(NUM_SENSORS)] = {INTAKE_INLET_TEMP_ADDR, INTAKE_OUTLET_TEMP_ADDR, EXHAUST_INLET_TEMP_ADDR, EXHAUST_OUTLET_TEMP_ADDR};
-float TEMPERATURES_C[(NUM_SENSORS)]    = {INVALID_TEMP, INVALID_TEMP, INVALID_TEMP, INVALID_TEMP};
-const char*      SENSOR_NAMES[(NUM_SENSORS)] = {"Intake Inlet", "Intake Outlet", "Exhaust Inlet", "Exhaust Outlet"}; 
+bool   COMMANDS[(NUM_CMD_PINS)] = {false, false, false, false};
 
 // Target air strem temp for cooling 
-const float COOL_TEMP_C            = 16; 
+const float COOL_TEMP_C            = 10; 
 const float NORM_TEMP_C            = 20; 
 const float HOT_TEMP_C             = 35; 
 
 // How closely do we try to control temperatures around the core. 
 const float CORE_TEMP_TOLERANCE_C  = 1.0;
 
-// Toggled to 1 whenever any input changes, 
-// either via an ISR, or via temp sensor polling. 
-volatile int inputsChanged = 0; 
+LCDPrint LCD;
+PWMFans PWM_FANS(PWM_MIN_DUTY_CYCLE, PWM_MIN_DUTY_CYCLE + 5.0); 
+GPIOOutputs BLOWERS("blowers"); 
 
-volatile int temperaturesChanged = 0;
+// Tx, TxEnable, Rx, RxEnable
+BangChannel GATEWAY(6, 7, 8, 9); 
 
-volatile int rasterDirty = 0; 
-
-char** lcdRaster;
-
-mbed::PwmOut* pwm[]    = { NULL, NULL, NULL, NULL };
-using namespace rtos; 
-Semaphore temperatureLock(1); 
-Semaphore rasterLock(1); 
-Thread motorThread; 
-Thread displayThread;
-Thread temperatureThread; 
-Thread lcdRefreshThread;
-
-void setup() {
-  initLcd(); 
-
-  printLn("Init Input Pins");
-
-  // Commands from homebridge/homekit automations
-  for (int i = 0; i < NUM_CMD_PINS; i++)
-  {
-    pinMode(CMD_PINS[i], INPUT_PULLDOWN);
-  }
-
-  printLn("Init Blower Pins"); 
-
-  for (int i = 0; i < NUM_BLOWER_PINS; i++)
-  {
-    pinMode(BLOWER_PINS[i], OUTPUT);
-    digitalWrite(BLOWER_PINS[i], HIGH);
-  }
-
-  printLn("Init PWM Pins"); 
-
-  for (int i = 0; i < NUM_PWM_PINS; i++)
-  {
-    pinMode(PWM_PINS[i], OUTPUT); 
-  }
-
-  temperatureThread.start(mbed::callback(temperatureThreadImpl));
-
-  waitForTemperatures(); 
-  delay(1000); 
-
-  printSensorAddresses(); 
-  delay(5000); 
-
-  printLn("Testing Blowers");
-
-  for (int i = 0; i < NUM_BLOWER_PINS; i++)
-  {
-    printfLn("%s", BLOWER_NAMES[i]);
-    
-    digitalWrite(BLOWER_PINS[i], LOW);
-    delay(1000);
-    digitalWrite(BLOWER_PINS[i], HIGH);
-    delay(2000);
-  }
-
-  printLn("Testing PWMs");
-
-  for (int i = 0; i < NUM_PWM_PINS; i++)
-  {
-    printfLn("%s", PWM_NAMES[i]);
-    
-    setPWM(pwm[i], PWM_PINS[i], PWM_FREQUENCY, 100.0);
-    delay(1000);
-    setPWM(pwm[i], PWM_PINS[i], PWM_FREQUENCY, PWM_MIN_DUTY_CYCLE);
-    delay(1000);
-    setPWM(pwm[i], PWM_PINS[i], PWM_FREQUENCY, 0.0);
-  }
-
-  printLn("Installing ISRs");
-
-  for (int i = 0; i < NUM_CMD_PINS; i++)
-  {
-    // Inputs from HK are interrupt driven to make the system instantly respond to changes. 
-    attachInterrupt(digitalPinToInterrupt(CMD_PINS[i]), handleInputChange, CHANGE);
-  }
-
-  printLn("Start display thread"); 
-  displayThread.start(mbed::callback(displayThreadImpl));
-  printLn("Start motor control"); 
-  motorThread.start(mbed::callback(motorThreadImpl));
-}
-
-void loop() { }
-
-int waitForTemperatures()
+const char* generateHostname()
 {
-  printLn("Wait for sensors"); 
-  printLn(" "); 
-  char padding[] = "============================";
-  int ready = 0; 
-  for(int retry = 0; retry < 12 && !ready; retry++) 
-  {
-    delay(5000); 
-    
-    ready = 1; 
-    for (int i = 0; i < NUM_SENSORS; i++)
-    {
-        if (TEMPERATURES_C[i] == INVALID_TEMP)
-        {
-          reprintfLn("... %s", SENSOR_NAMES[i]); 
-          ready = 0; 
-          break;
-        } 
-        else 
-        {
-          printfLn("[OK] %s", SENSOR_NAMES[i]); 
-        }
-    }
-  }
-
-  if (ready)
-  {
-    reprintfLn("Sensors ready!");
-  }
-  else 
-  {
-    reprintfLn("Sensors not ready");
-  }
-
-  return ready; 
+  return HOSTNAME; 
 }
 
-void printfLn(const char *format, ...)
+void aosInitialize() { }
+
+volatile int displayRefreshCycle = 0; 
+
+void aosSetup()
 {
-  char formatBuffer[1024];   
+  LCD.init(); 
+  LCD.printLn("Init PWM");
 
-  va_list arg;
-  va_start (arg, format);
-  vsprintf (formatBuffer, format, arg);
-  va_end (arg);
+  analogWriteFreq(PWM_FREQUENCY); 
 
-  printLn(formatBuffer); 
+  LCD.printLn("Init PWM Pins"); 
+
+  PWM_FANS.add("Intake PWM",      INTAKE_PWM     ); 
+  PWM_FANS.add("Exhaust PWM",     EXHAUST_PWM    ); 
+  PWM_FANS.add("Bypass PWM",      BYPASS_PWM     ); 
+  PWM_FANS.add("Core Assist PWM", CORE_ASSIST_PWM); 
+  PWM_FANS.execute(); 
+
+  LCD.printLn("Init Blower Pins"); 
+
+  BLOWERS.add("Intake",      INTAKE_BLOWER_ON,      false); 
+  BLOWERS.add("Exhaust",     EXHAUST_BLOWER_ON,     false); 
+  BLOWERS.add("Bypass",      BYPASS_BLOWER_ON,      false); 
+  BLOWERS.add("Core Assist", CORE_ASSIST_BLOWER_ON, false); 
+  BLOWERS.init(); 
+  BLOWERS.setAll(); 
+
+  TEMPERATURES.add("Intake Inlet",   "intakeInletTempC",   INTAKE_INLET_TEMP_ADDR  ); 
+  TEMPERATURES.add("Intake Outlet",  "intakeOutletTempC",  INTAKE_OUTLET_TEMP_ADDR ); 
+  TEMPERATURES.add("Exhaust Inlet",  "exhaustInletTempC",  EXHAUST_INLET_TEMP_ADDR ); 
+  TEMPERATURES.add("Exhaust Outlet", "exhaustOutletTempC", EXHAUST_OUTLET_TEMP_ADDR); 
+
+  LCD.printLn("Starting gateway."); 
+
+  GATEWAY.begin(); 
+
+  CORE_0_KERNEL->add(CORE_0_KERNEL, task_bangSend, 5000); 
+  CORE_0_KERNEL->addImmediate(CORE_0_KERNEL, task_lcdRefresh); 
 }
 
-void reprintfLn(const char *format, ...)
-{
-  char formatBuffer[1024];   
-
-  va_list arg;
-  va_start (arg, format);
-  vsprintf (formatBuffer, format, arg);
-  va_end (arg);
-
-  reprintLn(formatBuffer); 
+void aosSetup1()
+{ 
+  CORE_1_KERNEL->addImmediate(CORE_1_KERNEL, task_bangReceive); 
+  CORE_1_KERNEL->addImmediate(CORE_1_KERNEL, task_recomputeMotorStates); 
+  CORE_1_KERNEL->add(CORE_1_KERNEL, task_updateDisplay, 1000); 
+  CORE_1_KERNEL->add(CORE_1_KERNEL, task_updateNextBlower, TRANSITION_TIME_MS);
+  CORE_1_KERNEL->add(CORE_1_KERNEL, task_updatePWMs, TRANSITION_TIME_MS);
 }
 
-void scrollRaster()
+void task_bangSend()
 {
-  for (int i = 0; i < LCD_ROWS; i++)
+  String responseString = getHttpResponseString(); 
+  responseString.replace(",",",\r\n"); 
+  DPRINTF("Sending %s\r\n", responseString); 
+  GATEWAY.put(responseString);
+}
+
+void task_bangReceive()
+{
+  if (GATEWAY.ready())
   {
-      if (!i) 
-        free(lcdRaster[i]); 
-      else 
-        lcdRaster[i-1] = lcdRaster[i]; 
-  }
-  lcdRaster[LCD_ROWS - 1] = (char *)malloc(sizeof(char) * (LCD_COLS + 1));
-}
-
-void printLn(char * formatBuffer)
-{
-  while (strlen(formatBuffer) > 0)
-  {
-    rasterLock.acquire(); 
-    scrollRaster(); 
-    if (strlen(formatBuffer) >= LCD_COLS)
-    {
-      strncpy(lcdRaster[LCD_ROWS - 1], formatBuffer, LCD_COLS);
-      formatBuffer += LCD_COLS; 
-    }
-    else 
-    {
-      sprintf(lcdRaster[LCD_ROWS - 1], "%-*.*s", LCD_COLS, LCD_COLS, formatBuffer);
-      formatBuffer += strlen(formatBuffer); 
-    }
-    rasterDirty = 1; 
-    rasterLock.release(); 
-  }  
-}
-
-void reprintLn(char * formatBuffer)
-{
-  rasterLock.acquire(); 
-  lcdRaster[LCD_ROWS - 1][0] = 0; 
-  sprintf(lcdRaster[LCD_ROWS - 1], "%-*.*s", LCD_COLS, LCD_COLS, formatBuffer);
-  rasterDirty = 1; 
-  rasterLock.release(); 
-}
-
-void lcdRefreshThreadImpl()
-{
-  for(;;)
-  {
-    rasterLock.acquire(); 
-    rasterDirty = 0; 
-    for (int row = 0; row < LCD_ROWS; row++)
-    {
-      lcd.setCursor(0, row); 
-      lcd.print(lcdRaster[row]); 
-    }
-    rasterLock.release(); 
-    while (!rasterDirty)
-    {
-      rtos::ThisThread::sleep_for(1000);
-    }
+    String jsonString = GATEWAY.get();
+    parseJson(jsonString); 
   }
 }
 
-void initLcd()
+void parseJson(String jsonString)
 {
-  lcdRaster = (char **)malloc(sizeof(char*) * LCD_ROWS); 
-  for (int i = 0; i < LCD_ROWS; i++)
+  JsonDocument gatewayJson; 
+  DeserializationError err = deserializeJson(gatewayJson, jsonString.c_str());
+  
+  if (err) 
   {
-    lcdRaster[i] = (char *)malloc(sizeof(char) * (LCD_COLS + 1));
-    sprintf(lcdRaster[i], "%-*ls", LCD_COLS, "...");
+      LCD.printfLn("deserializeJson() failed: %s", err.c_str());
+      EPRINTF("deserializeJson() failed: %s\r\n", err.c_str());
+      return; 
   }
 
-  if (!i2CAddrTest(LCD_ADDRESS)) 
-  {
-    lcd = LiquidCrystal_I2C(0x3F, LCD_COLS, LCD_ROWS);
-  }
-  lcd.init();           // LCD driver initialization
-  lcd.backlight();  
-  lcdRefreshThread.start(mbed::callback(lcdRefreshThreadImpl));
+  COMMANDS[CMD_COOL_IDX]      = gatewayJson["hrvCommands"]["Cool"]; 
+  COMMANDS[CMD_SILENT_IDX]    = gatewayJson["hrvCommands"]["Silent"]; 
+  COMMANDS[CMD_VENTILATE_IDX] = gatewayJson["hrvCommands"]["Ventilate"]; 
+  COMMANDS[CMD_EXHAUST_IDX]   = gatewayJson["hrvCommands"]["Exhaust"]; 
 }
 
-int countSensors() 
+void populateHttpResponse(JsonDocument& document) 
 {
-  int count = 0;
-  while (ds.selectNext()) count++;
-  return count;
+  BLOWERS.addTo("blowers", document); 
+  PWM_FANS.addTo("blowerPWMs", document); 
+  document["hrvCommands"]["Cool"]      = COMMANDS[CMD_COOL_IDX]; 
+  document["hrvCommands"]["Silent"]    = COMMANDS[CMD_SILENT_IDX]; 
+  document["hrvCommands"]["Ventilate"] = COMMANDS[CMD_VENTILATE_IDX]; 
+  document["hrvCommands"]["Exhaust"]   = COMMANDS[CMD_EXHAUST_IDX]; 
 }
 
-int getSensorData(int* address, float* tempC, int nSensors) {
-  int i = 0;
-  while (ds.selectNext()) {
-    if (i < nSensors) {
-      uint8_t sensorAddress[8];
-      ds.getAddress(sensorAddress);
-      address[i] = sensorAddress[7];
-      tempC[i] = ds.getTempC();
-    }
-
-    i++;
-  }
-
-  return i;
+void task_updatePWMs()
+{
+  PWM_FANS.execute(); 
 }
 
-float getTempC(int requestedAddress, int* address, float* tempC, int nSensors)
+void task_updateNextBlower()
 {
-  int i;
-  for (i = 0; i < nSensors; i++) 
-  {
-    if (requestedAddress == address[i])
-    {
-      float tmpTempC = tempC[i];
-
-      if (tmpTempC == tmpTempC)
-      {
-        return tmpTempC; 
-      }
-    }
-  }
-
-  return INVALID_TEMP;
-}
-
-void updateTemperature(int requestedAddress, int* address, float* tempC, int nSensors, volatile float* currentTempC)
-{
-  float newTempC = getTempC(requestedAddress, address, tempC, nSensors); 
-
-  if (
-       newTempC != INVALID_TEMP 
-    && newTempC == newTempC     // NaN check
-  )
-  {
-    // Compare truncated to 1 decimal place 
-    int significantChange = (int)(*currentTempC * 10.0) != (int)(newTempC * 10.0); 
-    *currentTempC = newTempC; 
-    if (significantChange)
-    {
-      inputsChanged = 1; 
-    }
-  }
+  BLOWERS.setNext(); 
 }
 
 uint8_t extrapolatePWM(float gapC, float rangeC, float minGapC, float pwmMin, float pwmMax)
@@ -463,79 +305,76 @@ void pryApart(volatile float* pwm1, volatile float* pwm2, float minDifference, f
   }
 }
 
-void recomputeMotorStates() 
+void task_recomputeMotorStates() 
 {
   // Are we heating or cooling? 
   float targetTempC = COMMANDS[CMD_COOL_IDX] ? COOL_TEMP_C : NORM_TEMP_C; 
   float maxSpeed = COMMANDS[CMD_SILENT_IDX] ? 80 : 100; 
 
-  temperatureLock.acquire(); 
-
   // Intake and outlet idle at PWM_MIN_DUTY_CYCLE. The outlet 
   // of the exhaust side is a very good indicator of the core 
   // temperature due to the placement of the sensor. 
-  float coreTempC = TEMPERATURES_C[EXHAUST_OUTLET_IDX];
+  float coreTempC = TEMPERATURES[EXHAUST_OUTLET_TEMP_ADDR];
 
   // The exhaust idle flow gives us a good sample of room temperature
   // air, albeit a bit on the warm side if printers are running.
-  float estimatedRoomTempC = TEMPERATURES_C[EXHAUST_INLET_IDX]; 
+  float estimatedRoomTempC = TEMPERATURES[EXHAUST_INLET_TEMP_ADDR]; 
   
     // Try not to melt the core
-  int coreHot = TEMPERATURES_C[EXHAUST_OUTLET_IDX] > HOT_TEMP_C || TEMPERATURES_C[EXHAUST_INLET_IDX] > HOT_TEMP_C;
+  int coreHot = TEMPERATURES[EXHAUST_OUTLET_TEMP_ADDR] > HOT_TEMP_C || TEMPERATURES[EXHAUST_INLET_TEMP_ADDR] > HOT_TEMP_C;
 
-  float intakeOutletToTargetTempC       = computeGradientC(TEMPERATURES_C[INTAKE_OUTLET_IDX], targetTempC, 0.1);  
-  float coreToIntakeOutletTempC         = computeGradientC(coreTempC,                         TEMPERATURES_C[INTAKE_OUTLET_IDX], 0.1);
-  float intakeInletToIntakeOutletTempC  = computeGradientC(TEMPERATURES_C[INTAKE_INLET_IDX],  TEMPERATURES_C[INTAKE_OUTLET_IDX], 0.1);
-  float intakeInletToTargetTempC        = computeGradientC(TEMPERATURES_C[INTAKE_INLET_IDX],  targetTempC, 0.1);
-  float exhaustToCoreTempC              = computeGradientC(TEMPERATURES_C[EXHAUST_INLET_IDX], coreTempC, 0.1);
-  float estimatedRoomTempCToTargetTempC = computeGradientC(estimatedRoomTempC,                targetTempC, 0.1);
+  float intakeOutletToTargetTempC       = computeGradientC(TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR], targetTempC, 0.1);  
+  float coreToIntakeOutletTempC         = computeGradientC(coreTempC,                             TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR], 0.1);
+  float intakeInletToIntakeOutletTempC  = computeGradientC(TEMPERATURES[INTAKE_INLET_TEMP_ADDR],  TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR], 0.1);
+  float intakeInletToTargetTempC        = computeGradientC(TEMPERATURES[INTAKE_INLET_TEMP_ADDR],  targetTempC, 0.1);
+  float exhaustToCoreTempC              = computeGradientC(TEMPERATURES[EXHAUST_INLET_TEMP_ADDR], coreTempC, 0.1);
+  float estimatedRoomTempCToTargetTempC = computeGradientC(estimatedRoomTempC,                    targetTempC, 0.1);
 
   // Target the core temp the same distance from the target as the intake outlet is, but opposite. 
-  float targetCoreTempC = TEMPERATURES_C[INTAKE_OUTLET_IDX] > targetTempC
+  float targetCoreTempC = TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR] > targetTempC
           ? targetTempC - 2.0 : targetTempC + 2.0;
 
   float coreTempToTargetCoreTempC       = computeGradientC(coreTempC,                         targetCoreTempC, 0.1);
 
   // Try to position the core between the target temp and the exhaust temp. 
   float exhaustTempControlAmountC    = coreTempToTargetCoreTempC;
-  float intakeTempControlAmountC     = fmin(estimatedRoomTempCToTargetTempC, intakeOutletToTargetTempC); 
+  float intakeTempControlAmountC     = fmin(estimatedRoomTempCToTargetTempC, fmin(intakeOutletToTargetTempC, intakeInletToTargetTempC)); 
   float bypassTempControlAmountC     = fmin(intakeInletToTargetTempC, intakeOutletToTargetTempC); 
   float coreAssistTempControlAmountC = fmin(coreToIntakeOutletTempC, intakeOutletToTargetTempC);
 
   // Is the exhaust side useful for controlling temperature 
-  int exhaustEnableTempControl = TEMPERATURES_C[EXHAUST_INLET_IDX] > coreTempC
+  int exhaustEnableTempControl = TEMPERATURES[EXHAUST_INLET_TEMP_ADDR] > coreTempC
           ? coreTempC < targetCoreTempC
           : coreTempC > targetCoreTempC;
 
   // Is the intake air useful for controlling temperature
   int intakeEnableTempControl = estimatedRoomTempC > targetTempC  
-          ? TEMPERATURES_C[INTAKE_OUTLET_IDX] < estimatedRoomTempC 
-          : TEMPERATURES_C[INTAKE_OUTLET_IDX] > estimatedRoomTempC;
+          ? TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR] < estimatedRoomTempC 
+          : TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR] > estimatedRoomTempC;
 
-  int coreAssistEnable = TEMPERATURES_C[INTAKE_OUTLET_IDX] > targetTempC
-          ? coreTempC < TEMPERATURES_C[INTAKE_OUTLET_IDX]
-          : coreTempC > TEMPERATURES_C[INTAKE_OUTLET_IDX];
+  int coreAssistEnable = TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR] > targetTempC
+          ? coreTempC < TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR]
+          : coreTempC > TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR];
 
-  int bypassEnable = TEMPERATURES_C[INTAKE_OUTLET_IDX] > targetTempC
-          ? TEMPERATURES_C[INTAKE_INLET_IDX] < TEMPERATURES_C[INTAKE_OUTLET_IDX] 
-          : TEMPERATURES_C[INTAKE_INLET_IDX] > TEMPERATURES_C[INTAKE_OUTLET_IDX];
-
-  temperatureLock.release(); 
+  int bypassEnable = TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR] > targetTempC
+          ? TEMPERATURES[INTAKE_INLET_TEMP_ADDR] < TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR] 
+          : TEMPERATURES[INTAKE_INLET_TEMP_ADDR] > TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR];
 
   PWM_COMMANDS[INTAKE_IDX]     = !COMMANDS[CMD_EXHAUST_IDX]
       ? 
-          intakeEnableTempControl * extrapolatePWM(intakeTempControlAmountC, CORE_TEMP_TOLERANCE_C, 0, PWM_MIN_DUTY_CYCLE, maxSpeed) 
-        + COMMANDS[CMD_VENTILATE_IDX] * maxSpeed
-        + COMMANDS[CMD_COOL_IDX] * maxSpeed
-        + coreHot * maxSpeed
+          (intakeEnableTempControl * extrapolatePWM(intakeTempControlAmountC, 5.0, 1.0, PWM_MIN_DUTY_CYCLE, maxSpeed)) 
+        + ((COMMANDS[CMD_VENTILATE_IDX] ? 1.0 : 0.0) * maxSpeed)
+        + ((COMMANDS[CMD_COOL_IDX] ? 1.0 : 0.0) * maxSpeed)
+        + (coreHot * maxSpeed)
       : 0
       ;
 
   PWM_COMMANDS[EXHAUST_IDX]     = COMMANDS[CMD_EXHAUST_IDX] || COMMANDS[CMD_VENTILATE_IDX] || exhaustEnableTempControl || coreHot
       ?
-        exhaustEnableTempControl * extrapolatePWM(exhaustTempControlAmountC, CORE_TEMP_TOLERANCE_C, 0, PWM_MIN_DUTY_CYCLE, maxSpeed) 
-        + COMMANDS[CMD_EXHAUST_IDX] * 100.0
-        + coreHot * maxSpeed
+          (exhaustEnableTempControl * extrapolatePWM(exhaustTempControlAmountC, CORE_TEMP_TOLERANCE_C, 0, PWM_MIN_DUTY_CYCLE, maxSpeed))
+        + ((COMMANDS[CMD_VENTILATE_IDX] ? 1.0 : 0.0) * maxSpeed)
+        + (COMMANDS[CMD_EXHAUST_IDX] ? 100.0 : 0.0)
+        + (coreHot * maxSpeed)
       : 0
       ;
 
@@ -547,11 +386,6 @@ void recomputeMotorStates()
   PWM_COMMANDS[INTAKE_IDX ]     = clamp(PWM_COMMANDS[INTAKE_IDX     ], PWM_MIN_DUTY_CYCLE, maxSpeed);
   PWM_COMMANDS[BYPASS_IDX ]     = clamp(PWM_COMMANDS[BYPASS_IDX     ], 0,                  maxSpeed);
   PWM_COMMANDS[CA_IDX]          = clamp(PWM_COMMANDS[CA_IDX],          0,                  maxSpeed);
-
-  for (int i = 0; i < NUM_BLOWER_PINS; i++)
-  {
-    BLOWER_COMMANDS[i] = PWM_COMMANDS[i] >= 100.0;
-  }
   
   if (COMMANDS[CMD_SILENT_IDX])
   {
@@ -563,193 +397,67 @@ void recomputeMotorStates()
   {
     PWM_COMMANDS[BYPASS_IDX] = 0; 
   }
+
+  PWM_FANS.get(INTAKE_PWM     ).setCommand(PWM_COMMANDS[INTAKE_IDX]); 
+  PWM_FANS.get(EXHAUST_PWM    ).setCommand(PWM_COMMANDS[EXHAUST_IDX]); 
+  PWM_FANS.get(BYPASS_PWM     ).setCommand(PWM_COMMANDS[BYPASS_IDX]); 
+  PWM_FANS.get(CORE_ASSIST_PWM).setCommand(PWM_COMMANDS[CA_IDX]); 
+
+  BLOWERS.get(INTAKE_BLOWER_ON     ).setCommand(PWM_COMMANDS[INTAKE_IDX] >= 100.0);
+  BLOWERS.get(EXHAUST_BLOWER_ON    ).setCommand(PWM_COMMANDS[EXHAUST_IDX] >= 100.0);
+  BLOWERS.get(BYPASS_BLOWER_ON     ).setCommand(PWM_COMMANDS[BYPASS_IDX] >= 100.0);
+  BLOWERS.get(CORE_ASSIST_BLOWER_ON).setCommand(PWM_COMMANDS[CA_IDX] >= 100.0);
 }
 
-void updateMotorStates() 
-{
-  for (int i = 0; i < NUM_BLOWER_PINS; i++)
-  {
-    digitalWrite(BLOWER_PINS[i],      BLOWER_COMMANDS[i]     ? LOW : HIGH); 
-    BLOWER_STATES[i] = BLOWER_COMMANDS[i]; 
+////////////////
+// LCD 
+////////////////
 
-  }
+void task_lcdRefresh()
+{
+  LCD.refresh(); 
 }
 
-void updateDisplay() 
+void task_updateDisplay() 
 {
-  for (int i = 0; i < 8; i++)
+  displayRefreshCycle = displayRefreshCycle >= 8 ? 0 : displayRefreshCycle + 1; 
+  
+  if (displayRefreshCycle < 4)
   {
-    if (i < 4)
-    {
-      printfLn(
-            "I %5.1f <= %5.1f",
-            TEMPERATURES_C[INTAKE_OUTLET_IDX],
-            TEMPERATURES_C[INTAKE_INLET_IDX]);
-    }
-    else 
-    {
-      printfLn(
-              "E %5.1f => %5.1f",
-              TEMPERATURES_C[EXHAUST_INLET_IDX],
-              TEMPERATURES_C[EXHAUST_OUTLET_IDX]);
-    }
-
-    printfLn(
-            "%1s%1d%1s%1d%1s%1d%1s%1d%1s %1s%1s%1s%1s%1s ",
-            BLOWER_COMMANDS[INTAKE_IDX]     ? "I" : "i",
-            (int)(PWM_COMMANDS[INTAKE_IDX]    /11.1),
-            BLOWER_COMMANDS[EXHAUST_IDX]    ? "E" : "e",
-            (int)(PWM_COMMANDS[EXHAUST_IDX]   /11.1),
-            BLOWER_COMMANDS[BYPASS_IDX]    ? "B" : "b",
-            (int)(PWM_COMMANDS[BYPASS_IDX]    /11.1),
-            BLOWER_COMMANDS[CA_IDX]        ? "C" : "c",
-            (int)(PWM_COMMANDS[CA_IDX]/11.1),
-            motorStatesDirty() ? "*" : " ",
-
-            COMMANDS[CMD_COOL_IDX]      ? "C" : "c",
-            COMMANDS[CMD_SILENT_IDX]      ? "S" : "s",
-            COMMANDS[CMD_VENTILATE_IDX]   ? "V" : "v",
-            COMMANDS[CMD_EXHAUST_IDX]   ? "E" : "e",
-            inputsChanged ? "*" : " ",
-
-            ((i+1) % 2) == 0 ? "." : " "
+    LCD.printfLn(
+          "I %5.1f <= %5.1f",
+          TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR],
+          TEMPERATURES[INTAKE_INLET_TEMP_ADDR]
     );
+  }
+  else 
+  {
+    LCD.printfLn(
+            "E %5.1f => %5.1f",
+            TEMPERATURES[EXHAUST_INLET_TEMP_ADDR],
+            TEMPERATURES[EXHAUST_OUTLET_TEMP_ADDR]
+    );
+  }
+
+  LCD.printfLn(
+          "%1s%1d%1s%1d%1s%1d%1s%1d%1s %1s%1s%1s%1s%1s ",
+          BLOWERS[INTAKE_BLOWER_ON].getCommand()      ? "I" : "i",
+          (int)(PWM_COMMANDS[INTAKE_IDX]    /11.1),
+          BLOWERS[EXHAUST_BLOWER_ON].getCommand()     ? "E" : "e",
+          (int)(PWM_COMMANDS[EXHAUST_IDX]   /11.1),
+          BLOWERS[BYPASS_BLOWER_ON].getCommand()      ? "B" : "b",
+          (int)(PWM_COMMANDS[BYPASS_IDX]    /11.1),
+          BLOWERS[CORE_ASSIST_BLOWER_ON].getCommand() ? "C" : "c",
+          (int)(PWM_COMMANDS[CA_IDX]/11.1),
+          !BLOWERS.isSet() ? "*" : " ",
+
+          COMMANDS[CMD_COOL_IDX]       ? "C" : "c",
+          COMMANDS[CMD_SILENT_IDX]     ? "S" : "s",
+          COMMANDS[CMD_VENTILATE_IDX]  ? "V" : "v",
+          COMMANDS[CMD_EXHAUST_IDX]    ? "E" : "e",
+          false ? "*" : " ",
+
+          ((displayRefreshCycle+1) % 2) == 0 ? "." : " "
+  );
   
-    rtos::ThisThread::sleep_for(1000);
-  }
-}
-
-/* ISR - Any homekit switch change */
-void handleInputChange()
-{
-  inputsChanged = 1; 
-}
-
-void reReadInputs() 
-{
-  for (int i = 0; i < NUM_CMD_PINS; i++)
-  {
-    COMMANDS[i]      = digitalRead(CMD_PINS[i]) == HIGH;    // Active High
-  }
-}
-
-int motorStatesDirty()
-{  
-  for (int i = 0; i < NUM_BLOWER_PINS; i++)
-  {
-    if (BLOWER_COMMANDS[i] != BLOWER_STATES[i])
-      return 1; 
-  }
-
-  return 0; 
-}
-
-/* Computes the states the motors should be in and updates them. Runs every 60 seconds unless inputsChanged is toggled. */
-void motorThreadImpl() 
-{
-  int delayMotorStateChangeSeconds = 0;
-  for (;;) 
-  {
-    if (inputsChanged)
-    {
-      // Attempt to do a lock free synchronization to get a pseudo-consistent result. 
-      // If inputsChanged is toggled back on during the calculation, re-do it. 
-      do 
-      {
-        inputsChanged = 0; 
-        reReadInputs(); 
-        recomputeMotorStates();
-
-        for (int i = 0; i < NUM_PWM_PINS; i++)
-        {
-          setPWM(pwm[i], PWM_PINS[i], PWM_FREQUENCY, PWM_COMMANDS[i]);
-        }
-      } 
-      while (inputsChanged); 
-    }
-
-    if (motorStatesDirty())
-    {
-      if (delayMotorStateChangeSeconds <= 0) 
-      {
-        updateMotorStates();
-        delayMotorStateChangeSeconds = 15; 
-      } 
-    }
-
-    rtos::ThisThread::sleep_for(1000);
-
-    if (delayMotorStateChangeSeconds > 0)
-    {
-      delayMotorStateChangeSeconds--;
-    } 
-  }
-}
-
-/* Reads temperature sensors */
-void printSensorAddresses()
-{
-  int nSensors = countSensors();
-  if (nSensors == 0)
-  {
-    printLn("No sensors detected"); 
-    return; 
-  }
-
-  int* address = (int*)malloc(nSensors * sizeof(int));
-  float* tempC = (float*)malloc(nSensors * sizeof(float));
-  char buffer[1024]; 
-  temperatureLock.acquire(); 
-  nSensors = getSensorData(address, tempC, nSensors);
-  buffer[0] = 0; 
-  for (int i = 0; i < nSensors; i++)
-  {
-      sprintf(buffer + strlen(buffer), "%d ", address[i]); 
-  }
-  printLn(buffer); 
-  temperatureLock.release(); 
-  free(address);
-  free(tempC);
-  
-}
-
-/* Reads temperature sensors */
-void temperatureThreadImpl()
-{
-  for(;;)
-  {
-    int nSensors = countSensors();
-    int* address = (int*)malloc(nSensors * sizeof(int));
-    float* tempC = (float*)malloc(nSensors * sizeof(float));
-    temperatureLock.acquire(); 
-    nSensors = getSensorData(address, tempC, nSensors);
-    for (int i = 0; i < NUM_SENSORS; i++)
-    {
-      updateTemperature(TEMP_SENSOR_ADDRESSES[i], address, tempC, nSensors, &(TEMPERATURES_C[i]));
-    }
-    
-    temperatureLock.release(); 
-    free(address);
-    free(tempC);
-    rtos::ThisThread::sleep_for(1000);
-  }
-}
-
-void displayThreadImpl() 
-{
-  for (;;) 
-  {
-    updateDisplay();
-  }
-}
-
-bool i2CAddrTest(uint8_t addr) 
-{
-  Wire.begin();
-  Wire.beginTransmission(addr);
-  if (Wire.endTransmission() == 0) 
-  {
-    return true;
-  }
-  return false;
 }
