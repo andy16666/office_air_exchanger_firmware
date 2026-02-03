@@ -321,13 +321,13 @@ void task_recomputeMotorStates()
   float targetTempC = COMMANDS[CMD_COOL_IDX] ? COOL_TEMP_C : NORM_TEMP_C; 
   float maxSpeed    = COMMANDS[CMD_SILENT_IDX] ? 75 : 100; 
 
-  float caMaxSpeed     = clamp(PWM_FANS.get(CORE_ASSIST_PWM).getState() > 0     ? PWM_FANS.get(CORE_ASSIST_PWM).getState() * 2.0 : 10.0, 10.0, 100.0); 
-  float bypassMaxSpeed = clamp(PWM_FANS.get(BYPASS_PWM).getState() > 0          ? PWM_FANS.get(BYPASS_PWM).getState()      * 2.0 : 10.0, 10.0, 100.0); 
+  float core1TempC = TEMPERATURES[EXHAUST_OUTLET_TEMP_ADDR];
+  float core2TempC = TEMPERATURES[EXHAUST_SECOND_OUTLET_TEMP_ADDR];
 
   // Intake and outlet idle at PWM_MIN_DUTY_CYCLE. The outlet 
   // of the exhaust side is a very good indicator of the core 
   // temperature due to the placement of the sensor. 
-  float coreTempC = (TEMPERATURES[EXHAUST_OUTLET_TEMP_ADDR] + TEMPERATURES[EXHAUST_SECOND_OUTLET_TEMP_ADDR])/2;
+  float avgCoreTempC = (core1TempC + core2TempC)/2;
 
   float exhaustInletTempC = TEMPERATURES[EXHAUST_INLET_TEMP_ADDR]; 
 
@@ -339,34 +339,41 @@ void task_recomputeMotorStates()
   int coreHot = TEMPERATURES[EXHAUST_OUTLET_TEMP_ADDR] > HOT_TEMP_C || TEMPERATURES[EXHAUST_INLET_TEMP_ADDR] > HOT_TEMP_C;
 
   float intakeOutletToTargetTempC       = computeGradientC(TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR], targetTempC, 0.1);  
-  float coreToIntakeOutletTempC         = computeGradientC(coreTempC,                             TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR], 0.1);
+  float avgCoreToIntakeOutletTempC      = computeGradientC(avgCoreTempC,                          TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR], 0.1);
+  float core1ToIntakeIntercoreTempC     = computeGradientC(core1TempC,                            TEMPERATURES[INTAKE_INTERCORE_TEMP_ADDR], 0.1);
+  float core2ToIntakeOutletTempC        = computeGradientC(core2TempC,                            TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR], 0.1);
   float intakeInletToIntakeOutletTempC  = computeGradientC(TEMPERATURES[INTAKE_INLET_TEMP_ADDR],  TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR], 0.1);
   float intakeInletToTargetTempC        = computeGradientC(TEMPERATURES[INTAKE_INLET_TEMP_ADDR],  targetTempC, 0.1);
-  float exhaustToCoreTempC              = computeGradientC(TEMPERATURES[EXHAUST_INLET_TEMP_ADDR], coreTempC, 0.1);
+  float exhaustToCoreTempC              = computeGradientC(TEMPERATURES[EXHAUST_INLET_TEMP_ADDR], avgCoreTempC, 0.1);
   float exhaustInletTempCToTargetTempC = computeGradientC(exhaustInletTempC,                    targetTempC, 0.1);
 
   // Target the core temp the same distance from the target as the intake outlet is, but opposite. 
   float targetCoreTempC = TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR] > targetTempC
           ? targetTempC - 2.0 : targetTempC + 2.0;
 
-  float coreTempToTargetCoreTempC       = computeGradientC(coreTempC,                         targetCoreTempC, 0.1);
-
   bool intakeAboveTarget = TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR] > targetTempC;
 
-  bool coreAboveIntake = coreTempC > TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR]; 
+  bool coreAboveIntake = 
+         core1TempC > TEMPERATURES[INTAKE_INTERCORE_TEMP_ADDR] 
+      || core2TempC > TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR];
   bool bypassAboveIntake = TEMPERATURES[INTAKE_INLET_TEMP_ADDR] > TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR];
 
   bool bypassUseful =     ((intakeAboveTarget && !bypassAboveIntake) || (!intakeAboveTarget && bypassAboveIntake)) && intakeInletToIntakeOutletTempC > 0;
-  bool coreAssistUseful = ((intakeAboveTarget && !coreAboveIntake  ) || (!intakeAboveTarget && coreAboveIntake  )) && coreToIntakeOutletTempC > 0; 
+  bool coreAssistUseful = ((intakeAboveTarget && !coreAboveIntake  ) || (!intakeAboveTarget && coreAboveIntake  )) && core1ToIntakeIntercoreTempC > 0 && core2ToIntakeOutletTempC > 0; 
 
-  bool preferBypass = (bypassUseful && !coreAssistUseful) || (bypassUseful && coreAssistUseful && intakeInletToIntakeOutletTempC > coreToIntakeOutletTempC); 
+  bool exhaustAboveCore = exhaustInletTempC > avgCoreTempC; 
+
+  bool preferBypass = (bypassUseful && !coreAssistUseful) || (bypassUseful && coreAssistUseful && intakeInletToIntakeOutletTempC > core2ToIntakeOutletTempC); 
 
   // Try to position the core between the target temp and the exhaust temp. 
   float intakeTempControlAmountC     = intakeOutletToTargetTempC < 5.0 ? (5.0 - intakeOutletToTargetTempC) : 0.0;
-  float exhaustTempControlAmountC    = exhaustInletTempC > 25.0 ? (exhaustInletTempC > 30.0 ? 5.0 : (exhaustInletTempC - 25.0)) : 0.0;
+
+  bool coolExhaust = exhaustInletTempC > 25.0; 
+
+  float exhaustCoolAmountC    = coolExhaust ? (exhaustInletTempC - 25.0): 0.0;
   
   float bypassTempControlAmountC     = bypassUseful     ? intakeOutletToTargetTempC/(intakeInletToIntakeOutletTempC/5.0) : 0.0; 
-  float coreAssistTempControlAmountC = coreAssistUseful ? intakeOutletToTargetTempC/(coreToIntakeOutletTempC       /5.0) : 0.0;
+  float coreAssistTempControlAmountC = coreAssistUseful ? intakeOutletToTargetTempC/(core2ToIntakeOutletTempC      /5.0) : 0.0;
 
   bool coreAssistEnable = coreAssistUseful && !preferBypass;
   bool bypassEnable = bypassUseful && preferBypass;
@@ -374,18 +381,9 @@ void task_recomputeMotorStates()
   // Is the intake air useful for controlling temperature
   bool intakeEnableTempControl = intakeOutletToTargetTempC < 5.0;
 
-  // Is the exhaust side useful for controlling temperature 
-  bool exhaustEnableTempControl = 
-        (exhaustInletTempC > 25.0)
-        || ( 
-          intakeEnableTempControl 
-          && coreAssistEnable 
-          && ( 
-            exhaustInletTempC > coreTempC
-              ? coreTempC < targetCoreTempC
-              : coreTempC > targetCoreTempC
-          )
-        );
+  bool exhaustUseful = ((exhaustAboveCore && !intakeAboveTarget) || (!exhaustAboveCore && intakeAboveTarget)) && exhaustToCoreTempC > 0 && coreAssistEnable; 
+  
+  float exhaustTempControlAmountC = (exhaustUseful ? exhaustToCoreTempC : 0.0) + exhaustCoolAmountC; 
 
   PWM_COMMANDS[INTAKE_IDX]     = !COMMANDS[CMD_EXHAUST_IDX]
       ? 
@@ -395,16 +393,25 @@ void task_recomputeMotorStates()
       : 0
       ;
 
-  PWM_COMMANDS[EXHAUST_IDX]     = COMMANDS[CMD_EXHAUST_IDX] || COMMANDS[CMD_VENTILATE_IDX] || exhaustEnableTempControl || coreHot || coreAssistEnable
+  bool intakeFullyActive = PWM_COMMANDS[INTAKE_IDX] >= 50.0; 
+
+  // Is the exhaust side useful for controlling temperature 
+  bool exhaustEnableTempControl = coolExhaust || ( exhaustUseful && intakeFullyActive );
+
+  PWM_COMMANDS[EXHAUST_IDX]     = COMMANDS[CMD_EXHAUST_IDX] || COMMANDS[CMD_VENTILATE_IDX] || exhaustEnableTempControl || coreHot
       ?
           (exhaustEnableTempControl ? extrapolatePWM(exhaustTempControlAmountC, 5.0, 0, PWM_MIN_DUTY_CYCLE, maxSpeed) : 0.0)
         + (COMMANDS[CMD_VENTILATE_IDX] ? 50.0 : 0.0)
         + (COMMANDS[CMD_EXHAUST_IDX] ? 100.0 : 0.0)
         + (coreHot ? 100.0 : 0.0)
-      : 0
+      : (PWM_COMMANDS[INTAKE_IDX] / 2.0)
       ;
 
-  
+  float tempControlMaxSpeed = intakeFullyActive ? 100.0 : 45.0; 
+  float caMaxSpeed     = clamp(
+    PWM_FANS.get(CORE_ASSIST_PWM).getState() > 0     ? PWM_FANS.get(CORE_ASSIST_PWM).getState() * 1.25 : PWM_MIN_DUTY_CYCLE, PWM_MIN_DUTY_CYCLE, tempControlMaxSpeed); 
+  float bypassMaxSpeed = clamp(
+    PWM_FANS.get(BYPASS_PWM).getState() > 0          ? PWM_FANS.get(BYPASS_PWM).getState()      * 1.25 : PWM_MIN_DUTY_CYCLE, PWM_MIN_DUTY_CYCLE, tempControlMaxSpeed); 
 
   PWM_COMMANDS[CA_IDX]          = coreAssistEnable        ? extrapolatePWM(coreAssistTempControlAmountC,   CORE_TEMP_TOLERANCE_C, 0.1, PWM_MIN_DUTY_CYCLE, caMaxSpeed    ) : 0.0;
   PWM_COMMANDS[BYPASS_IDX]      = bypassEnable            ? extrapolatePWM(bypassTempControlAmountC,       CORE_TEMP_TOLERANCE_C, 0.1, PWM_MIN_DUTY_CYCLE, bypassMaxSpeed) : 0.0;
@@ -447,8 +454,54 @@ void task_updateDisplay()
 {
   displayRefreshCycle = displayRefreshCycle >= 8 ? 0 : displayRefreshCycle + 1; 
   
+  /*
+  --------------------
+  100% 24.8 v      
+  100% -18.0    -18.3 
+  -15.9 |-12.4 |-10.5 
+    ^             v
+
+  */
+
+  LCD.printfLn(
+        "E%3.0f%%%5.1fv  %1s%1s%1s%1s%1s%1s%1s",
+        PWM_COMMANDS[EXHAUST_IDX],
+        TEMPERATURES[EXHAUST_INLET_TEMP_ADDR],
+        !BLOWERS.isSet() ? "*" : " ",
+        COMMANDS[CMD_COOL_IDX]       ? "C" : "c",
+        COMMANDS[CMD_SILENT_IDX]     ? "S" : "s",
+        COMMANDS[CMD_VENTILATE_IDX]  ? "V" : "v",
+        COMMANDS[CMD_EXHAUST_IDX]    ? "E" : "e",
+        false ? "*" : " ",
+        ((displayRefreshCycle+1) % 2) == 0 ? "." : " "
+  );
+
+  LCD.printfLn(
+        "%5.1fvv%5.1fvv",
+        TEMPERATURES[EXHAUST_OUTLET_TEMP_ADDR],
+        TEMPERATURES[EXHAUST_SECOND_OUTLET_TEMP_ADDR]
+  );
   
   LCD.printfLn(
+        "%5.1f%2s%5.1f %2s%5.1f",
+        TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR],
+        PWM_COMMANDS[CA_IDX] > 0 ? "<<" : PWM_COMMANDS[BYPASS_IDX] > 0 ? "<|" : "==",
+        TEMPERATURES[INTAKE_INTERCORE_TEMP_ADDR],
+        PWM_COMMANDS[CA_IDX] > 0 ? "<<" : PWM_COMMANDS[BYPASS_IDX] > 0 ? "|v" : "==",
+        TEMPERATURES[INTAKE_INLET_TEMP_ADDR]
+  );
+
+  LCD.printfLn(
+        "I%3.0f%%%2s%2s%3.0f%%%2s",
+        PWM_COMMANDS[INTAKE_IDX],
+        PWM_COMMANDS[CA_IDX] > 0 ? "  " : (PWM_COMMANDS[BYPASS_IDX] > 0 ? "^<" : " |"),
+        PWM_COMMANDS[CA_IDX] > 0 ? "CA" : (PWM_COMMANDS[BYPASS_IDX] > 0 ? "BP" : "--"),
+        PWM_COMMANDS[CA_IDX] > 0 ? PWM_COMMANDS[CA_IDX] : PWM_COMMANDS[BYPASS_IDX],
+        PWM_COMMANDS[CA_IDX] > 0 ? "  " : (PWM_COMMANDS[BYPASS_IDX] > 0 ? "<<" : "| ")
+
+  );
+
+  /*LCD.printfLn(
         "I%5.1f <=%5.1f      ",
         TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR],
         TEMPERATURES[INTAKE_INLET_TEMP_ADDR]
@@ -482,6 +535,6 @@ void task_updateDisplay()
           false ? "*" : " ",
 
           ((displayRefreshCycle+1) % 2) == 0 ? "." : " "
-  );
+  );*/
   
 }
