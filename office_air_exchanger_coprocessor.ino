@@ -293,6 +293,7 @@ void task_recomputeMotorStates()
   float avgCoreToIntakeOutletTempC      = computeGradientC(avgCoreTempC,                          TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR], 0.1);
   float core1ToIntakeIntercoreTempC     = computeGradientC(core1TempC,                            TEMPERATURES[INTAKE_INTERCORE_TEMP_ADDR], 0.1);
   float core2ToIntakeOutletTempC        = computeGradientC(core2TempC,                            TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR], 0.1);
+  float core2ToTargetTempC              = computeGradientC(core2TempC,                            targetTempC, 0.1);
   float intakeInletToIntakeOutletTempC  = computeGradientC(TEMPERATURES[INTAKE_INLET_TEMP_ADDR],  TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR], 0.1);
   float intakeInletToTargetTempC        = computeGradientC(TEMPERATURES[INTAKE_INLET_TEMP_ADDR],  targetTempC, 0.1);
   float exhaustToCoreTempC              = computeGradientC(TEMPERATURES[EXHAUST_INLET_TEMP_ADDR], avgCoreTempC, 0.1);
@@ -309,8 +310,17 @@ void task_recomputeMotorStates()
       || core2TempC > TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR];
   bool bypassAboveIntake = TEMPERATURES[INTAKE_INLET_TEMP_ADDR] > TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR];
 
-  bool bypassUseful =     ((intakeAboveTarget && !bypassAboveIntake) || (!intakeAboveTarget && bypassAboveIntake)) && intakeInletToIntakeOutletTempC > 0;
+  bool coreAboveTarget = core2TempC > targetTempC;
+  bool bypassAboveTarget =  TEMPERATURES[INTAKE_INLET_TEMP_ADDR] > targetTempC; 
+
+  bool bypassUseful     = ((intakeAboveTarget && !bypassAboveIntake) || (!intakeAboveTarget && bypassAboveIntake)) && intakeInletToIntakeOutletTempC > 0;
   bool coreAssistUseful = ((intakeAboveTarget && !coreAboveIntake  ) || (!intakeAboveTarget && coreAboveIntake  )) && core1ToIntakeIntercoreTempC > 0 && core2ToIntakeOutletTempC > 0; 
+
+  bool bypassBeyondTarget     = ((bypassAboveTarget && !intakeAboveTarget) || (!bypassAboveTarget && intakeAboveTarget)) && bypassUseful && intakeInletToTargetTempC > 0;
+  bool coreAssistBeyondTarget = ((coreAboveTarget   && !intakeAboveTarget) || (!coreAboveIntake   && intakeAboveTarget)) && coreAssistUseful && core2ToTargetTempC > 0;
+
+  float bypassRange = bypassBeyondTarget ? intakeInletToTargetTempC : 0.5; 
+  float coreAssistRange = coreAssistBeyondTarget ? core2ToTargetTempC : 0.5; 
 
   bool exhaustAboveCore = exhaustInletTempC > core1TempC && exhaustInletTempC > core2TempC; 
 
@@ -374,12 +384,12 @@ void task_recomputeMotorStates()
   PWM_COMMANDS[CA_IDX]          =
     PWM_FANS.get(BYPASS_PWM).getState() > 0 ? 0.0 : 
     extrapolateGradualPWM(
-      coreAssistEnable ? coreAssistTempControlAmountC : 0.0, 1, 0.1, PWM_MIN_DUTY_CYCLE, tempControlMaxSpeed, PWM_FANS.get(CORE_ASSIST_PWM).getCommand(), tempAdjustmentSpeed) 
+      coreAssistEnable ? coreAssistTempControlAmountC : 0.0, coreAssistRange, 0.1, PWM_MIN_DUTY_CYCLE, tempControlMaxSpeed, PWM_FANS.get(CORE_ASSIST_PWM).getCommand(), 1) 
     ;
   PWM_COMMANDS[BYPASS_IDX]      =        
     PWM_FANS.get(CORE_ASSIST_PWM).getState() > 0 ? 0.0 :      
     extrapolateGradualPWM(
-      bypassEnable ? bypassTempControlAmountC : 0.0,     3, 0.1, PWM_MIN_DUTY_CYCLE, tempControlMaxSpeed, PWM_FANS.get(BYPASS_PWM).getCommand(), tempAdjustmentSpeed) 
+      bypassEnable ? bypassTempControlAmountC : 0.0,     bypassRange, 0.1, PWM_MIN_DUTY_CYCLE, tempControlMaxSpeed, PWM_FANS.get(BYPASS_PWM).getCommand(), 1) 
     ;
 
   PWM_COMMANDS[INTAKE_IDX] = clampf(PWM_COMMANDS[INTAKE_IDX], PWM_COMMANDS[BYPASS_IDX], maxSpeed); 
