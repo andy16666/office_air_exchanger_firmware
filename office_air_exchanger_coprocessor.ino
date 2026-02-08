@@ -338,8 +338,7 @@ void task_recomputeMotorStates()
 
   bool bypassUseful     = sourceUseful(TEMPERATURES[INTAKE_INLET_TEMP_ADDR], intakeTempC, targetTempC); 
   bool coreAssistUseful =
-         sourceUseful(core1TempC, TEMPERATURES[INTAKE_INTERCORE_TEMP_ADDR], targetTempC)
-      && sourceUseful(core2TempC, intakeTempC, targetTempC); 
+        sourceUseful(core2TempC, intakeTempC, targetTempC); 
 
   bool preferBypass = (bypassUseful && !coreAssistUseful) || (bypassUseful && coreAssistUseful && intakeInletToIntakeOutletTempC > core2ToIntakeOutletTempC); 
   bool coreAssistEnable = coreAssistUseful && !preferBypass;
