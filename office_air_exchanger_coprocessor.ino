@@ -411,7 +411,17 @@ void task_recomputeMotorStates()
     : 0.0
   ); 
 
-  PWM_COMMANDS[INTAKE_IDX]  = clampf(fmax(ventilatePwm, intakeTempControlPwm), PWM_COMMANDS[BYPASS_IDX], fmax(30.0, maxSpeed - fmax(PWM_COMMANDS[CA_IDX]-30.0, 0.0)));
+  float targetIntakeSpeed = fmax(ventilatePwm, intakeTempControlPwm); 
+
+  float minIntakeSpeed = preferBypass
+            ? fmax(targetIntakeSpeed * 0.75, PWM_COMMANDS[BYPASS_IDX] * 0.75)
+            : targetIntakeSpeed * 0.75; 
+
+  float maxIntakeSpeed = preferBypass 
+            ? fmin(targetIntakeSpeed * 1.25, PWM_COMMANDS[BYPASS_IDX] * 1.25)
+            : fmin(targetIntakeSpeed * 0.75, maxSpeed - fmax(PWM_COMMANDS[CA_IDX]-30.0, 0.0)); 
+
+  PWM_COMMANDS[INTAKE_IDX]  = clampf(targetIntakeSpeed, minIntakeSpeed, maxIntakeSpeed);
 
   PWM_COMMANDS[EXHAUST_IDX] = fmax(ventilatePwm, fmax(exhaustTempControlPwm, coolExhaustPwm));
   
