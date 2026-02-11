@@ -65,7 +65,7 @@
 #define INVALID_TEMP FLT_MIN
 
 #define PWM_FREQUENCY      25000
-#define PWM_MIN_DUTY_CYCLE    10.0 
+#define PWM_MIN_DUTY_CYCLE    5.0 
 
 // 
 // 124, 120, 129
@@ -314,9 +314,6 @@ void task_recomputeMotorStates()
   // The exhaust idle flow gives us a good sample of room temperature
   // air, albeit a bit on the warm side if printers are running.
   float estimatedRoomTempC = TEMPERATURES[EXHAUST_INLET_TEMP_ADDR]; 
-  
-    // Try not to melt the core
-  int coreHot = TEMPERATURES[EXHAUST_OUTLET_TEMP_ADDR] > HOT_TEMP_C || TEMPERATURES[EXHAUST_INLET_TEMP_ADDR] > HOT_TEMP_C;
 
   float intakeOutletToTargetTempC       = computeGradientC(intakeTempC, targetTempC, 0.1);  
   float core2ToIntakeOutletTempC        = computeGradientC(core2TempC,                            intakeTempC, 0.1);
@@ -347,8 +344,11 @@ void task_recomputeMotorStates()
   bool bypassBeyondTarget     = bypassUseful && sourceBeyondTarget(TEMPERATURES[INTAKE_INLET_TEMP_ADDR], intakeTempC, targetTempC);
   bool coreAssistBeyondTarget = coreAssistUseful && sourceBeyondTarget(core2TempC, intakeTempC, targetTempC);
 
-  float bypassRange = bypassBeyondTarget ? intakeInletToTargetTempC : 0.5; 
-  float coreAssistRange = coreAssistBeyondTarget ? core2ToTargetTempC : 0.5; 
+  float bypassRange     = bypassBeyondTarget     ? fmax(intakeInletToTargetTempC, 1.0) : 3.0; 
+  float coreAssistRange = coreAssistBeyondTarget ? fmax(core2ToTargetTempC,       1.0) : 3.0; 
+
+  float bypassAmountC     = bypassBeyondTarget     ? intakeOutletToTargetTempC : intakeInletToIntakeOutletTempC; 
+  float coreAssistAmountC = coreAssistBeyondTarget ? intakeOutletToTargetTempC : core2ToIntakeOutletTempC; 
 
   bool exhaustAboveCore = exhaustInletTempC > core1TempC && exhaustInletTempC > core2TempC; 
   bool exhaustBelowCore = exhaustInletTempC < core1TempC && exhaustInletTempC < core2TempC; 
@@ -373,18 +373,7 @@ void task_recomputeMotorStates()
       sourceUseful(exhaustInletTempC, core2TempC, core2TargetC) 
       && coreAssistEnable; 
 
-  float ventilatePwm = (clampi(COMMANDS[CMD_VENTILATE_IDX], 0, 100.0)); 
-  float intakeTempControlPwm = (intakeEnableTempControl 
-      ? extrapolateGradualPWM(intakeTempControlAmountC, 5.0, 0, PWM_MIN_DUTY_CYCLE, maxSpeed, PWM_FANS.get(INTAKE_PWM).getCommand(), 1)
-      : 0.0
-    ); 
-
-  PWM_COMMANDS[INTAKE_IDX]     = !COMMANDS[CMD_EXHAUST_IDX]
-      ? 
-          fmax(ventilatePwm, intakeTempControlPwm)
-        + (coreHot ? 100.0 : 0.0)
-      : 0
-      ;
+  float ventilatePwm = clampi(COMMANDS[CMD_VENTILATE_IDX], 0, 100.0); 
 
   bool intakeFullyActive = PWM_COMMANDS[INTAKE_IDX] >= 50.0; 
 
@@ -406,58 +395,41 @@ void task_recomputeMotorStates()
 
   float exhaustTempControlPwm = fmax(exhaustTempControlCore2Pwm, exhaustTempControlCore1Pwm);
 
-  PWM_COMMANDS[EXHAUST_IDX]     = COMMANDS[CMD_EXHAUST_IDX] || COMMANDS[CMD_VENTILATE_IDX] || exhaustUsefulCore1 || exhaustUsefulCore2 || coolExhaust || coreHot
-      ?
-          fmax(ventilatePwm, fmax(exhaustTempControlPwm, coolExhaustPwm))
-        + (COMMANDS[CMD_EXHAUST_IDX] ? 100.0 : 0.0)
-        + (coreHot ? 100.0 : 0.0)
-      : (PWM_COMMANDS[INTAKE_IDX] / 2.0)
-      ;
-
-  float tempControlMaxSpeed = intakeFullyActive ? 100.0 : 80.0; 
-  
   PWM_COMMANDS[CA_IDX]          =
     PWM_FANS.get(BYPASS_PWM).getState() > 0 ? 0.0 : 
     extrapolateGradualPWM(
-      coreAssistEnable ? intakeOutletToTargetTempC : 0.0, coreAssistRange, coreAssistRange/10.0, PWM_MIN_DUTY_CYCLE, tempControlMaxSpeed, PWM_FANS.get(CORE_ASSIST_PWM).getCommand(), tempControlMaxChange) 
+      coreAssistEnable ? coreAssistAmountC : 0.0, coreAssistRange, coreAssistRange/20.0, PWM_MIN_DUTY_CYCLE, maxSpeed, PWM_FANS.get(CORE_ASSIST_PWM).getCommand(), tempControlMaxChange) 
     ;
   PWM_COMMANDS[BYPASS_IDX]      =        
     PWM_FANS.get(CORE_ASSIST_PWM).getState() > 0 ? 0.0 :      
     extrapolateGradualPWM(
-      bypassEnable ? intakeOutletToTargetTempC : 0.0,     bypassRange, bypassRange/10.0, PWM_MIN_DUTY_CYCLE, tempControlMaxSpeed, PWM_FANS.get(BYPASS_PWM).getCommand(), tempControlMaxChange) 
+      bypassEnable ? bypassAmountC : 0.0,     bypassRange, bypassRange/20.0, PWM_MIN_DUTY_CYCLE, maxSpeed, PWM_FANS.get(BYPASS_PWM).getCommand(), tempControlMaxChange) 
     ;
 
-  PWM_COMMANDS[INTAKE_IDX] = clampf(PWM_COMMANDS[INTAKE_IDX], PWM_COMMANDS[BYPASS_IDX], maxSpeed); 
+  float intakeTempControlPwm = (intakeEnableTempControl 
+    ? extrapolateGradualPWM(intakeTempControlAmountC, 5.0, 0, PWM_MIN_DUTY_CYCLE, maxSpeed, PWM_FANS.get(INTAKE_PWM).getCommand(), tempControlMaxChange)
+    : 0.0
+  ); 
+
+  PWM_COMMANDS[INTAKE_IDX]  = clampf(fmax(ventilatePwm, intakeTempControlPwm), PWM_COMMANDS[BYPASS_IDX], fmax(30.0, maxSpeed - fmax(PWM_COMMANDS[CA_IDX]-30.0, 0.0)));
+
+  PWM_COMMANDS[EXHAUST_IDX] = fmax(ventilatePwm, fmax(exhaustTempControlPwm, coolExhaustPwm));
   
   // Always idle the intake and outlet at PWM_MIN_DUTY_CYCLE so we have an accurate temp sample. 
-  PWM_COMMANDS[EXHAUST_IDX]     = clampf(
-    (PWM_FANS.get(EXHAUST_PWM).getCommand() + PWM_COMMANDS[EXHAUST_IDX    ])/2.0, 
-    fmax(PWM_MIN_DUTY_CYCLE + 1.0, PWM_COMMANDS[INTAKE_IDX]/2.0),
-    maxSpeed); 
-  PWM_COMMANDS[INTAKE_IDX ]     = clampf(
-    (PWM_FANS.get(INTAKE_PWM).getCommand() + PWM_COMMANDS[INTAKE_IDX     ])/2.0, 
-    fmax(PWM_MIN_DUTY_CYCLE + 1.0, PWM_COMMANDS[EXHAUST_IDX]/2.0), 
-    maxSpeed);
-  PWM_COMMANDS[BYPASS_IDX ]     = clampf(PWM_COMMANDS[BYPASS_IDX     ], 0,                  tempControlMaxSpeed);
-  PWM_COMMANDS[CA_IDX]          = clampf(PWM_COMMANDS[CA_IDX],          0,                  tempControlMaxSpeed);
+  PWM_COMMANDS[EXHAUST_IDX]     = clampf(PWM_COMMANDS[EXHAUST_IDX], fmax(20.0, PWM_COMMANDS[INTAKE_IDX]/2.0),  maxSpeed); 
+  PWM_COMMANDS[INTAKE_IDX ]     = clampf(PWM_COMMANDS[INTAKE_IDX ], fmax(20.0, PWM_COMMANDS[EXHAUST_IDX]/2.0), maxSpeed);
+  PWM_COMMANDS[BYPASS_IDX ]     = clampf(PWM_COMMANDS[BYPASS_IDX ], 0,                  100.0);
+  PWM_COMMANDS[CA_IDX]          = clampf(PWM_COMMANDS[CA_IDX     ], 0,                  100.0);
   
-  /*if (COMMANDS[CMD_SILENT_IDX])
-  {
-    if (bypassEnable) 
-      pryApart(&PWM_COMMANDS[INTAKE_IDX], &PWM_COMMANDS[BYPASS_IDX], 10, maxSpeed + 5); 
-    else if (coreAssistEnable) 
-      pryApart(&PWM_COMMANDS[INTAKE_IDX], &PWM_COMMANDS[CA_IDX], 10, maxSpeed + 5); 
-  }*/
-  
-  PWM_FANS.get(INTAKE_PWM     ).setCommand(PWM_COMMANDS[INTAKE_IDX]); 
-  PWM_FANS.get(EXHAUST_PWM    ).setCommand(PWM_COMMANDS[EXHAUST_IDX]); 
+  PWM_FANS.get(INTAKE_PWM     ).setCommand((PWM_FANS.get(INTAKE_PWM ).getCommand() + PWM_COMMANDS[INTAKE_IDX     ])/2.0); 
+  PWM_FANS.get(EXHAUST_PWM    ).setCommand((PWM_FANS.get(EXHAUST_PWM).getCommand() + PWM_COMMANDS[EXHAUST_IDX    ])/2.0); 
   PWM_FANS.get(BYPASS_PWM     ).setCommand(PWM_COMMANDS[BYPASS_IDX]); 
   PWM_FANS.get(CORE_ASSIST_PWM).setCommand(PWM_COMMANDS[CA_IDX]); 
 
-  BLOWERS.get(INTAKE_BLOWER_ON     ).setCommand(PWM_COMMANDS[INTAKE_IDX] >= 50.0);
+  BLOWERS.get(INTAKE_BLOWER_ON     ).setCommand(PWM_COMMANDS[INTAKE_IDX]  >= 50.0);
   BLOWERS.get(EXHAUST_BLOWER_ON    ).setCommand(PWM_COMMANDS[EXHAUST_IDX] >= 50.0);
-  BLOWERS.get(BYPASS_BLOWER_ON     ).setCommand(PWM_COMMANDS[BYPASS_IDX] >= 50.0);
-  BLOWERS.get(CORE_ASSIST_BLOWER_ON).setCommand(PWM_COMMANDS[CA_IDX] >= 50.0);
+  BLOWERS.get(BYPASS_BLOWER_ON     ).setCommand(PWM_COMMANDS[BYPASS_IDX]  >= 50.0);
+  BLOWERS.get(CORE_ASSIST_BLOWER_ON).setCommand(PWM_COMMANDS[CA_IDX]      >= 50.0);
 }
 
 ////////////////
@@ -495,8 +467,7 @@ void task_updateDisplay()
   );
 
   LCD.printfLn(
-        "%-4.1f%5.1f   %5.1f",
-        TEMPERATURES.get(INTAKE_OUTLET_TEMP_ADDR).getRateOfChangeDegreesPerSecond(),
+        "     %5.1f   %5.1f",
         TEMPERATURES[EXHAUST_SECOND_OUTLET_TEMP_ADDR], 
         TEMPERATURES[EXHAUST_OUTLET_TEMP_ADDR]
   );
@@ -511,14 +482,12 @@ void task_updateDisplay()
   );
 
   LCD.printfLn(
-        "I%3.0f%%%2s%2s%3.0f%%%2s%3.1f",
+        "I%3.0f%%%2s%2s%3.0f%%%2s",
         PWM_COMMANDS[INTAKE_IDX],
         PWM_COMMANDS[CA_IDX] > 0 ? "  " : (PWM_COMMANDS[BYPASS_IDX] > 0 ? "^<" : " |"),
         PWM_COMMANDS[CA_IDX] > 0 ? "CA" : (PWM_COMMANDS[BYPASS_IDX] > 0 ? "BP" : "--"),
         PWM_COMMANDS[CA_IDX] > 0 ? PWM_COMMANDS[CA_IDX] : PWM_COMMANDS[BYPASS_IDX],
-        PWM_COMMANDS[CA_IDX] > 0 ? "  " : (PWM_COMMANDS[BYPASS_IDX] > 0 ? "<<" : "| "),
-        TEMPERATURES.get(INTAKE_OUTLET_TEMP_ADDR).getAgeSeconds()
-
+        PWM_COMMANDS[CA_IDX] > 0 ? "  " : (PWM_COMMANDS[BYPASS_IDX] > 0 ? "<<" : "| ")
   );
 
   /*LCD.printfLn(

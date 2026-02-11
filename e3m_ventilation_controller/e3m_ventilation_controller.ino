@@ -48,20 +48,6 @@ PWMFan HOTEND_EXHAUST_PWM("hotendExhaust", 7, PWM_MIN, 30, 100);
 #define E3M_FRONT_STACK_TEMP 32
 #define HOTEND_TEMP 188
 
-typedef enum {
-  CMD_DHR_OFF = 'O',
-  CMD_DHR_COOL = 'C', 
-  CMD_DHR_HEAT = 'H'
-} heat_recovery_command_t; 
-
-typedef enum {
-  DHR_IDLE = 'I', 
-  DHR_COOL = 'C',
-  DHR_HEAT = 'H'
-} heat_receovery_state_t; 
-
-static volatile heat_recovery_command_t           command                __attribute__((section(".uninitialized_data"))); 
-
 const char* generateHostname()
 {
   return HOSTNAME; 
@@ -69,21 +55,12 @@ const char* generateHostname()
 
 void aosInitialize()
 {
-  command = CMD_DHR_OFF; 
 }
 
 void aosSetup() 
 {
   TEMPERATURES.add("Hotend Temp 1", "e3mFrontStackTemp", E3M_FRONT_STACK_TEMP); 
   TEMPERATURES.add("Hotend Temp 2", "hotendTemp2", HOTEND_TEMP); 
-
-  pinMode(14, INPUT); 
-  pinMode(15, INPUT); 
-  pinMode(16, INPUT); 
-  pinMode(17, INPUT); 
-  pinMode(22, OUTPUT); 
-
-  digitalWrite(22, 1); 
 }
 
 void aosSetup1()
@@ -97,8 +74,6 @@ void populateHttpResponse(JsonDocument& document)
 {
   UNDER_SHELF_MAIN_PWM.addTo("fans", document); 
   HOTEND_EXHAUST_PWM.addTo("fans", document); 
-  
-  document["command"] = String((char)command).c_str(); 
 }
 
 bool handleHttpArg(String argName, String arg) 
@@ -128,7 +103,7 @@ void task_processCommands()
         ? 
           extrapolatePWM(
             computeGradientC(TEMPERATURES[HOTEND_TEMP], TARGET_HOTEND_TEMP_C, 1.0), 
-            70.0, 0.1, PWM_MIN, 100
+            20.0, 0.1, PWM_MIN, 100
           ) : 0; 
 
     HOTEND_EXHAUST_PWM.setCommand(hotendPwm); 
