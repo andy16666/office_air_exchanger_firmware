@@ -41,7 +41,7 @@ using namespace AOS;
 static volatile bool            cmdCool                __attribute__((section(".uninitialized_data"))); 
 static volatile bool            cmdSilent              __attribute__((section(".uninitialized_data"))); 
 static volatile int             cmdVentilate           __attribute__((section(".uninitialized_data"))); 
-static volatile bool            cmdExhaust             __attribute__((section(".uninitialized_data"))); 
+static volatile int             cmdExhaust             __attribute__((section(".uninitialized_data"))); 
 
 volatile float intakeInletTempC = 0; 
 volatile float intakeOutletTempC = 0; 
@@ -64,7 +64,7 @@ void aosInitialize()
   cmdCool = false; 
   cmdSilent = false; 
   cmdVentilate = 0; 
-  cmdExhaust = false; 
+  cmdExhaust = 0; 
 }
 
 void aosSetup() 
