@@ -68,8 +68,11 @@
 #define PWM_MIN_DUTY_CYCLE    5.0 
 
 #define CA_BLOWER_MARGIN      40.0
-#define EXHAUST_BLOWER_MARGIN 40.0 
-#define BYPASS_BLOWER_MARGIN  25.0
+#define EXHAUST_BLOWER_MARGIN 20.0 
+#define BYPASS_BLOWER_MARGIN  15.0
+
+#define BLOWER_CUTOUT_SPEED 40.0
+#define BLOWER_CUTIN_SPEED  55.0
 
 // 
 // 124, 120, 129
@@ -300,15 +303,18 @@ void task_recomputeMotorStates()
 {   
   float exhaustCoolTargetC = 20.0; 
 
+  bool cmdSilent = COMMANDS[CMD_SILENT_IDX]; 
+
   double intakeRateOfChange = TEMPERATURES.get(INTAKE_OUTLET_TEMP_ADDR).getRateOfChangeDegreesPerSecond(); 
   float intakeTempC         = TEMPERATURES[INTAKE_OUTLET_TEMP_ADDR]; 
 
-  float cmdVentilatePwm     = clampf(COMMANDS[CMD_VENTILATE_IDX], 0, 100.0); 
-  float cmdExhaustPwm       = clampf(COMMANDS[CMD_EXHAUST_IDX],   0, 100.0); 
+  float maxSpeed    = cmdSilent ? 75 : 100; 
+  float cmdVentilatePwm     = clampf(COMMANDS[CMD_VENTILATE_IDX] * (cmdSilent ? 0.5 : 1.0), 0, 100.0); 
+  float cmdExhaustPwm       = clampf(COMMANDS[CMD_EXHAUST_IDX  ] * (cmdSilent ? 0.5 : 1.0), 0, 100.0); 
 
   // Are we heating or cooling? 
   float targetTempC = COMMANDS[CMD_COOL_IDX] ? COOL_TEMP_C : NORM_TEMP_C; 
-  float maxSpeed    = COMMANDS[CMD_SILENT_IDX] ? 75 : 100; 
+  
 
   float core1TempC = TEMPERATURES[EXHAUST_OUTLET_TEMP_ADDR];
   float core2TempC = TEMPERATURES[EXHAUST_SECOND_OUTLET_TEMP_ADDR];
@@ -316,7 +322,7 @@ void task_recomputeMotorStates()
   // Intake and outlet idle at PWM_MIN_DUTY_CYCLE. The outlet 
   // of the exhaust side is a very good indicator of the core 
   // temperature due to the placement of the sensor. 
-  float avgCoreTempC = (core1TempC + core2TempC)/2;
+  float avgCoreTempC = (core1TempC + core2TempC)/2.0f;
 
   float exhaustInletTempC = TEMPERATURES[EXHAUST_INLET_TEMP_ADDR]; 
 
@@ -406,6 +412,8 @@ void task_recomputeMotorStates()
   float targetExhaustSpeed = fmaxv({20.0f, cmdVentilatePwm*0.8f,       intakeTempControlPwm/2.0f, exhaustTempControlPwm,      coolExhaustPwm,      cmdExhaustPwm});
   float targetIntakeSpeed  = fmaxv({20.0f, cmdVentilatePwm,            intakeTempControlPwm,      exhaustTempControlPwm/2.0f, coolExhaustPwm/2.0f, cmdExhaustPwm/2.0f}); 
 
+  float tempControlMaxSpeed = fmin(targetIntakeSpeed * 1.25, maxSpeed); 
+
   PWM_COMMANDS[CA_IDX]          =
     PWM_FANS.get(BYPASS_PWM).getState() > 0 ? 0.0 : 
     extrapolateGradualPWM(
@@ -413,7 +421,7 @@ void task_recomputeMotorStates()
       coreAssistRange, 
       coreAssistRange/20.0, 
       PWM_MIN_DUTY_CYCLE, 
-      fmin(targetIntakeSpeed * 1.25, maxSpeed), 
+      tempControlMaxSpeed, 
       PWM_COMMANDS[CA_IDX], 
       tempControlMaxChange
     );
@@ -425,7 +433,7 @@ void task_recomputeMotorStates()
       bypassRange, 
       bypassRange/20.0, 
       PWM_MIN_DUTY_CYCLE, 
-      fmin(targetIntakeSpeed * 1.25, maxSpeed), 
+      tempControlMaxSpeed, 
       PWM_COMMANDS[BYPASS_IDX], 
       tempControlMaxChange
     );
@@ -437,38 +445,53 @@ void task_recomputeMotorStates()
   PWM_COMMANDS[CA_IDX     ]     = clampf(PWM_COMMANDS[CA_IDX     ], 0,    maxSpeed);
   
   PWM_FANS.get(INTAKE_PWM     ).setSuggestion(
-    calculateBlowerAdjustedPwm(PWM_COMMANDS[INTAKE_IDX], 20.0, maxSpeed, BLOWERS.get(INTAKE_BLOWER_ON).getState(), 0)
+    calculateBlowerAdjustedPwm(PWM_COMMANDS[INTAKE_IDX], PWM_MIN_DUTY_CYCLE, maxSpeed, BLOWERS.get(INTAKE_BLOWER_ON).getState(), 0)
   ); 
   PWM_FANS.get(EXHAUST_PWM    ).setSuggestion(
-    calculateBlowerAdjustedPwm(PWM_COMMANDS[EXHAUST_IDX], 20.0, maxSpeed, BLOWERS.get(EXHAUST_BLOWER_ON).getState(), EXHAUST_BLOWER_MARGIN)
+    calculateBlowerAdjustedPwm(PWM_COMMANDS[EXHAUST_IDX], PWM_MIN_DUTY_CYCLE, maxSpeed, BLOWERS.get(EXHAUST_BLOWER_ON).getState(), EXHAUST_BLOWER_MARGIN)
   ); 
   PWM_FANS.get(BYPASS_PWM     ).setSuggestion(
-    calculateBlowerAdjustedPwm(PWM_COMMANDS[BYPASS_IDX], PWM_MIN_DUTY_CYCLE, maxSpeed, BLOWERS.get(BYPASS_BLOWER_ON).getState(), BYPASS_BLOWER_MARGIN)
+    calculateBlowerAdjustedPwm(PWM_COMMANDS[BYPASS_IDX], PWM_MIN_DUTY_CYCLE, tempControlMaxSpeed, BLOWERS.get(BYPASS_BLOWER_ON).getState(), BYPASS_BLOWER_MARGIN)
   ); 
   PWM_FANS.get(CORE_ASSIST_PWM).setSuggestion(
-    calculateBlowerAdjustedPwm(PWM_COMMANDS[CA_IDX], PWM_MIN_DUTY_CYCLE, maxSpeed, BLOWERS.get(CORE_ASSIST_BLOWER_ON).getState(), CA_BLOWER_MARGIN)
+    calculateBlowerAdjustedPwm(PWM_COMMANDS[CA_IDX], PWM_MIN_DUTY_CYCLE, tempControlMaxSpeed, BLOWERS.get(CORE_ASSIST_BLOWER_ON).getState(), CA_BLOWER_MARGIN)
   ); 
 
-  BLOWERS.get(INTAKE_BLOWER_ON     ).setCommand(BLOWERS.get(INTAKE_BLOWER_ON     ).getState() ? PWM_COMMANDS[INTAKE_IDX ] >= 45.0 : PWM_COMMANDS[INTAKE_IDX ] >= 55.0);
-  BLOWERS.get(EXHAUST_BLOWER_ON    ).setCommand(BLOWERS.get(EXHAUST_BLOWER_ON    ).getState() ? PWM_COMMANDS[EXHAUST_IDX] >= 45.0 : PWM_COMMANDS[EXHAUST_IDX] >= 55.0);
-  BLOWERS.get(BYPASS_BLOWER_ON     ).setCommand(BLOWERS.get(BYPASS_BLOWER_ON     ).getState() ? PWM_COMMANDS[BYPASS_IDX ] >= 45.0 : PWM_COMMANDS[BYPASS_IDX ] >= 55.0);
-  BLOWERS.get(CORE_ASSIST_BLOWER_ON).setCommand(BLOWERS.get(CORE_ASSIST_BLOWER_ON).getState() ? PWM_COMMANDS[CA_IDX     ] >= 45.0 : PWM_COMMANDS[CA_IDX     ] >= 55.0);
+  BLOWERS.get(INTAKE_BLOWER_ON     ).setCommand(calculateBlowerCommand(INTAKE_BLOWER_ON,      INTAKE_IDX  ));
+  BLOWERS.get(EXHAUST_BLOWER_ON    ).setCommand(calculateBlowerCommand(EXHAUST_BLOWER_ON,     EXHAUST_IDX ));
+  BLOWERS.get(BYPASS_BLOWER_ON     ).setCommand(calculateBlowerCommand(BYPASS_BLOWER_ON,      BYPASS_IDX  ));
+  BLOWERS.get(CORE_ASSIST_BLOWER_ON).setCommand(calculateBlowerCommand(CORE_ASSIST_BLOWER_ON, CA_IDX      ));
+}
+
+/* 
+ * Calculate the new state for the blower based on the PWM_COMMAND set.
+ */
+bool calculateBlowerCommand(pin_size_t blowerPin, int pwmIdx)
+{
+  return BLOWERS.get(blowerPin).getState() 
+    ? PWM_COMMANDS[pwmIdx] >= BLOWER_CUTOUT_SPEED 
+    : PWM_COMMANDS[pwmIdx] >= BLOWER_CUTIN_SPEED;
 }
 
 float calculateBlowerAdjustedPwm(float pwm, float min, float max, bool blowerOn, float margin)
 {
-  if (pwm <= min)
-    return pwm; 
+  if (pwm < min)
+    return 0; 
 
-  if (pwm >= max)
-    return pwm;  
+  if (pwm > max)
+    return max;  
 
   if (margin <= 0)
     return pwm; 
 
   float adjustedPwm = ((pwm-min) * (1.0 + (margin/(max-min)))) + min; 
 
-  return clampf(blowerOn ? adjustedPwm - margin : adjustedPwm, min, max); 
+  float newPwm = blowerOn ? adjustedPwm - margin : adjustedPwm; 
+
+  if (newPwm < min)
+    return 0; 
+
+  return clampf(newPwm, min, max); 
 }
 
 ////////////////
@@ -522,12 +545,13 @@ void task_updateDisplay()
   );
 
   LCD.printfLn(
-        "I%3.0f%%%2s%2s%3.0f%%%2s",
+        "I%3.0f%%%2s%2s%3.0f%%%2s %3.0f%%",
         PWM_COMMANDS[INTAKE_IDX],
         PWM_COMMANDS[CA_IDX] > 0 ? "  " : (PWM_COMMANDS[BYPASS_IDX] > 0 ? "^<" : " |"),
         PWM_COMMANDS[CA_IDX] > 0 ? "CA" : (PWM_COMMANDS[BYPASS_IDX] > 0 ? "BP" : "--"),
         PWM_COMMANDS[CA_IDX] > 0 ? PWM_COMMANDS[CA_IDX] : PWM_COMMANDS[BYPASS_IDX],
-        PWM_COMMANDS[CA_IDX] > 0 ? "  " : (PWM_COMMANDS[BYPASS_IDX] > 0 ? "<<" : "| ")
+        PWM_COMMANDS[CA_IDX] > 0 ? "  " : (PWM_COMMANDS[BYPASS_IDX] > 0 ? "<<" : "| "),
+        PWM_COMMANDS[CA_IDX] > 0 ? PWM_FANS.get(CORE_ASSIST_PWM).getState() : PWM_FANS.get(BYPASS_PWM).getState()
   );
 
   /*LCD.printfLn(
