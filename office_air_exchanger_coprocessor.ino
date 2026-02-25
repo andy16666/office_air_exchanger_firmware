@@ -343,6 +343,9 @@ void task_recomputeMotorStates()
   float exhaustToCore2TempC             = computeGradientC(TEMPERATURES[EXHAUST_INLET_TEMP_ADDR], core2TempC, 0.1);
   float exhaustInletTempCToTargetTempC  = computeGradientC(exhaustInletTempC,                     targetTempC, 0.1);
 
+  bool exhaustAboveCore = exhaustInletTempC > core1TempC && exhaustInletTempC > core2TempC; 
+  bool exhaustBelowCore = exhaustInletTempC < core1TempC && exhaustInletTempC < core2TempC; 
+
   bool intakeAboveTarget = intakeTempC > targetTempC;
 
   float tempControlMaxChange = calculateControlChangeMaxRatePctPerSecond(TEMPERATURES.get(INTAKE_OUTLET_TEMP_ADDR), targetTempC); 
@@ -362,9 +365,6 @@ void task_recomputeMotorStates()
 
   float bypassAmountC     = bypassBeyondTarget     ? intakeOutletToTargetTempC : intakeInletToIntakeOutletTempC; 
   float coreAssistAmountC = coreAssistBeyondTarget ? intakeOutletToTargetTempC : core2ToIntakeOutletTempC; 
-
-  bool exhaustAboveCore = exhaustInletTempC > core1TempC && exhaustInletTempC > core2TempC; 
-  bool exhaustBelowCore = exhaustInletTempC < core1TempC && exhaustInletTempC < core2TempC; 
 
   // Is the intake air useful for controlling temperature
   bool intakeEnableTempControl = intakeOutletToTargetTempC < 5.0;
