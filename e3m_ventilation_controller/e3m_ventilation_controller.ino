@@ -21,7 +21,7 @@
 
 #define PWM_FREQUENCY 25000
 #define HOSTNAME "e3mvent"
-#define PWM_MIN 10
+#define PWM_MIN 28
 #define TARGET_HOTEND_TEMP_C 30
 #define TARGET_FRONT_STACK_TEMP_C 20
 
@@ -37,6 +37,7 @@
 #include <ArduinoJson.h>
 
 #include <PWMFan.h>
+#include <PIDController.h> 
 
 using namespace AOS; 
 
@@ -44,6 +45,9 @@ using namespace AOS;
 
 PWMFan UNDER_SHELF_MAIN_PWM("underShelfMain", 6, PWM_MIN, 30, 100); 
 PWMFan HOTEND_EXHAUST_PWM("hotendExhaust", 7, PWM_MIN, 30, 100); 
+
+PIDController UNDER_SHELF_MAIN_PID_CONTROLLER(120, 0.5, 0.5, 0.5);
+PIDController HOTEND_EXHAUST_PID_CONTROLLER(120, 0.5, 0.5, 0.5);
 
 #define E3M_FRONT_STACK_TEMP 32
 #define HOTEND_TEMP 188
@@ -67,7 +71,7 @@ void aosSetup1()
 {
   analogWriteFreq(PWM_FREQUENCY); 
 
-  CORE_1_KERNEL->add(CORE_1_KERNEL, task_processCommands, TRANSITION_TIME_MS);  
+  CORE_1_KERNEL->add(CORE_1_KERNEL, task_processCommands, 1000);  
 }
 
 void populateHttpResponse(JsonDocument& document) 
@@ -96,31 +100,30 @@ bool handleHttpArg(String argName, String arg)
 
 void task_processCommands()
 {
-  if (TEMPERATURES.get(HOTEND_TEMP).getAgeSeconds() < 5.0)
-  {
-    bool hotendCoolingEnabled = TEMPERATURES[HOTEND_TEMP] > TARGET_HOTEND_TEMP_C; 
-    float hotendPwm = hotendCoolingEnabled 
-        ? 
-          extrapolatePWM(
-            computeGradientC(TEMPERATURES[HOTEND_TEMP], TARGET_HOTEND_TEMP_C, 1.0), 
-            20.0, 0.1, PWM_MIN, 100
-          ) : 0; 
+  float e3mFrontStackTempToTargetFrontStackTempC = computeGradientC(TEMPERATURES[E3M_FRONT_STACK_TEMP], TARGET_FRONT_STACK_TEMP_C, 0.1); 
+  float hotendTempToTargetHotendTempC = computeGradientC(TEMPERATURES[HOTEND_TEMP], TARGET_HOTEND_TEMP_C, 0.1); 
 
-    HOTEND_EXHAUST_PWM.setCommand(hotendPwm); 
-    HOTEND_EXHAUST_PWM.execute(); 
-  }
-
-  if (TEMPERATURES.get(E3M_FRONT_STACK_TEMP).getAgeSeconds() < 5.0)
-  {
-    bool frontStackCoolingEnabled = TEMPERATURES[E3M_FRONT_STACK_TEMP] > TARGET_FRONT_STACK_TEMP_C; 
-    float frontStackPwm = frontStackCoolingEnabled 
+  bool frontStackCoolingEnabled = TEMPERATURES[E3M_FRONT_STACK_TEMP] > TARGET_FRONT_STACK_TEMP_C; 
+  bool hotendCoolingEnabled = TEMPERATURES[HOTEND_TEMP] > TARGET_HOTEND_TEMP_C; 
+  
+  float hotendPwm = hotendCoolingEnabled 
       ? 
         extrapolatePWM(
-          computeGradientC(TEMPERATURES[E3M_FRONT_STACK_TEMP], TARGET_FRONT_STACK_TEMP_C, 1.0), 
-          15.0, 0.1, PWM_MIN, 100
-        ) : 0; 
+          HOTEND_EXHAUST_PID_CONTROLLER.addAndGetError(hotendTempToTargetHotendTempC), 
+          20.0, 0.1, 20.0, 100
+        ) : 0;
 
-    UNDER_SHELF_MAIN_PWM.setCommand(frontStackPwm); 
-    UNDER_SHELF_MAIN_PWM.execute(); 
-  }
+  float frontStackPwm = frontStackCoolingEnabled 
+    ? 
+      extrapolatePWM(
+        UNDER_SHELF_MAIN_PID_CONTROLLER.addAndGetError(e3mFrontStackTempToTargetFrontStackTempC), 
+        15.0, 0.1, 28.0, 100
+      ) : 0; 
+
+
+  HOTEND_EXHAUST_PWM.setCommand(hotendPwm); 
+  HOTEND_EXHAUST_PWM.execute(); 
+
+  UNDER_SHELF_MAIN_PWM.setCommand(frontStackPwm); 
+  UNDER_SHELF_MAIN_PWM.execute(); 
 }
