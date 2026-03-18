@@ -101,29 +101,25 @@ bool handleHttpArg(String argName, String arg)
 void task_processCommands()
 {
   float e3mFrontStackTempToTargetFrontStackTempC = computeGradientC(TEMPERATURES[E3M_FRONT_STACK_TEMP], TARGET_FRONT_STACK_TEMP_C, 0.1); 
-  float hotendTempToTargetHotendTempC = computeGradientC(TEMPERATURES[HOTEND_TEMP], TARGET_HOTEND_TEMP_C, 0.1); 
-
-  bool frontStackCoolingEnabled = TEMPERATURES[E3M_FRONT_STACK_TEMP] > TARGET_FRONT_STACK_TEMP_C; 
-  bool hotendCoolingEnabled = TEMPERATURES[HOTEND_TEMP] > TARGET_HOTEND_TEMP_C; 
+  float hotendTempToTargetHotendTempC            = computeGradientC(TEMPERATURES[HOTEND_TEMP], TARGET_HOTEND_TEMP_C, 0.1); 
   
-  float hotendPwm = hotendCoolingEnabled 
-      ? 
-        extrapolatePWM(
-          HOTEND_EXHAUST_PID_CONTROLLER.addAndGetError(hotendTempToTargetHotendTempC), 
-          20.0, 0.1, 20.0, 100
-        ) : 0;
-
-  float frontStackPwm = frontStackCoolingEnabled 
-    ? 
+  float hotendPwm =
       extrapolatePWM(
-        UNDER_SHELF_MAIN_PID_CONTROLLER.addAndGetError(e3mFrontStackTempToTargetFrontStackTempC), 
-        15.0, 0.1, 28.0, 100
-      ) : 0; 
+        TEMPERATURES[HOTEND_TEMP] > TARGET_HOTEND_TEMP_C,
+        hotendTempToTargetHotendTempC, 
+        10.0, 0.1, PWM_MIN, 100, HOTEND_EXHAUST_PID_CONTROLLER
+      );
 
+  float frontStackPwm = 
+      extrapolatePWM(
+        TEMPERATURES[E3M_FRONT_STACK_TEMP] > TARGET_FRONT_STACK_TEMP_C,
+        e3mFrontStackTempToTargetFrontStackTempC, 
+        15.0, 0.1, PWM_MIN, 100, UNDER_SHELF_MAIN_PID_CONTROLLER
+      );
 
   HOTEND_EXHAUST_PWM.setCommand(hotendPwm); 
   HOTEND_EXHAUST_PWM.execute(); 
 
-  UNDER_SHELF_MAIN_PWM.setCommand(frontStackPwm); 
+  UNDER_SHELF_MAIN_PWM.setCommand(fmax(frontStackPwm, hotendPwm)); 
   UNDER_SHELF_MAIN_PWM.execute(); 
 }

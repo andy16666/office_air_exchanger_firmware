@@ -66,24 +66,28 @@
 #define INVALID_TEMP FLT_MIN
 
 #define PWM_FREQUENCY         25000
-#define PWM_MIN_DUTY_CYCLE    5.0 
-#define INTAKE_MIN            28.0
-#define EXHAUST_MIN           28.0
+#define PWM_MIN_DUTY_CYCLE    5.0f 
+#define INTAKE_MIN            28.0f
+#define EXHAUST_MIN           28.0f
 
-#define INTAKE_BLOWER_MARGIN  20.0
-#define CA_BLOWER_MARGIN      40.0
-#define EXHAUST_BLOWER_MARGIN 20.0 
-#define BYPASS_BLOWER_MARGIN  15.0
+// Percentage PWM the blower replaces. The PWM is rescaled to a maximum of 
+// 100% + MARGIN. When the blower engages, the PWM is reduced by this value. 
+#define INTAKE_BLOWER_MARGIN  15.0
+#define CA_BLOWER_MARGIN      12.0
+#define EXHAUST_BLOWER_MARGIN 10.0
+#define BYPASS_BLOWER_MARGIN  12.0
 
-#define BLOWER_CUTOUT_SPEED 40.0
+// Blowers cut in when pwm command exceeds the cutin value, and cut out
+// again once it falls below. Commanded pwm is adjusted by margin based 
+// on whether or not the blower is actually on at time of calculation. 
 #define BLOWER_CUTIN_SPEED  55.0
-#define INTAKE_BLOWER_CUTIN_SPEED 70.0
-#define INTAKE_BLOWER_CUTOUT_SPEED 60.0
+#define BLOWER_CUTOUT_SPEED 40.0
+#define INTAKE_BLOWER_CUTIN_SPEED 80.0
+#define INTAKE_BLOWER_CUTOUT_SPEED 75.0
 
 // 
-// 124, 120, 129
 #define INTAKE_INLET_TEMP_ADDR   234
-#define INTAKE_OUTLET_TEMP_ADDR  129 // 119
+#define INTAKE_OUTLET_TEMP_ADDR  129 // 119 retired 
 #define EXHAUST_INLET_TEMP_ADDR  166 
 #define EXHAUST_OUTLET_TEMP_ADDR  41
 #define INTAKE_INTERCORE_TEMP_ADDR 124 // ?
@@ -373,11 +377,8 @@ void task_recomputeMotorStates()
               ? fmax(core2ToTargetTempC, intakeInletToCore2Temp * 0.3) 
               : intakeInletToCore2Temp * 0.3; 
 
-  float bypassAmountC     = BYPASS_PID_CONTROLLER.addAndGetError(bypassBeyondTarget     ? intakeOutletToTargetTempC : intakeInletToIntakeOutletTempC); 
-  float coreAssistAmountC = CA_PID_CONTROLLER    .addAndGetError(coreAssistBeyondTarget ? intakeOutletToTargetTempC : core2ToIntakeOutletTempC); 
-
-  if (!bypassEnable)     BYPASS_PID_CONTROLLER.reset(); 
-  if (!coreAssistEnable) CA_PID_CONTROLLER    .reset(); 
+  float bypassAmountC     = bypassBeyondTarget     ? intakeOutletToTargetTempC : intakeInletToIntakeOutletTempC; 
+  float coreAssistAmountC = coreAssistBeyondTarget ? intakeOutletToTargetTempC : core2ToIntakeOutletTempC; 
 
   // Is the intake air useful for controlling temperature
   bool intakeEnableTempControl = intakeOutletToTargetTempC < 5.0;
@@ -406,21 +407,28 @@ void task_recomputeMotorStates()
   float core2TempControlRate = calculateControlChangeMaxRatePctPerSecond(TEMPERATURES.get(EXHAUST_SECOND_OUTLET_TEMP_ADDR), core2TempC); 
   float core1TempControlRate = calculateControlChangeMaxRatePctPerSecond(TEMPERATURES.get(EXHAUST_OUTLET_TEMP_ADDR), core1TempC);
   
-  float exhaustTempControlCore1Pwm = (exhaustUsefulCore1
-      ? extrapolateGradualPWM(exhaustToCore1TempC, 15.0, 2, PWM_MIN_DUTY_CYCLE, maxSpeed, PWM_COMMANDS[EXHAUST_IDX], core1TempControlRate) 
-      : 0.0); 
+  float exhaustTempControlCore1Pwm =
+    extrapolateGradualPWM(
+      exhaustUsefulCore1, 
+      exhaustToCore1TempC, 
+      15.0, 2, PWM_MIN_DUTY_CYCLE, maxSpeed, PWM_COMMANDS[EXHAUST_IDX], core1TempControlRate
+    ); 
 
-  float exhaustTempControlCore2Pwm = (exhaustUsefulCore2 
-    ? extrapolateGradualPWM(exhaustToCore1TempC, 15.0, 2, PWM_MIN_DUTY_CYCLE, maxSpeed, PWM_COMMANDS[EXHAUST_IDX], core2TempControlRate) 
-    : 0.0
-  ); 
+  float exhaustTempControlCore2Pwm = 
+    extrapolateGradualPWM(
+      exhaustUsefulCore2, 
+      exhaustToCore1TempC, 
+      15.0, 2, PWM_MIN_DUTY_CYCLE, maxSpeed, PWM_COMMANDS[EXHAUST_IDX], core2TempControlRate
+    ); 
 
   float exhaustTempControlPwm = fmax(exhaustTempControlCore2Pwm, exhaustTempControlCore1Pwm);
 
-  float intakeTempControlPwm = (intakeEnableTempControl 
-    ? extrapolateGradualPWM(intakeTempControlAmountC, 5.0, 0, PWM_MIN_DUTY_CYCLE,  maxSpeed/2.0, PWM_COMMANDS[INTAKE_IDX], tempControlMaxChange)
-    : 0.0
-  ); 
+  float intakeTempControlPwm = 
+    extrapolateGradualPWM(
+      intakeEnableTempControl, 
+      intakeTempControlAmountC, 
+      5.0, 0, PWM_MIN_DUTY_CYCLE,  maxSpeed/2.0, PWM_COMMANDS[INTAKE_IDX], tempControlMaxChange
+    ); 
 
   float targetExhaustSpeed = fmaxv({20.0f, cmdVentilatePwm*0.8f,       intakeTempControlPwm/2.0f, exhaustTempControlPwm,      coolExhaustPwm,      cmdExhaustPwm});
   float targetIntakeSpeed  = fmaxv({20.0f, cmdVentilatePwm,            intakeTempControlPwm,      exhaustTempControlPwm/2.0f, coolExhaustPwm/2.0f, cmdExhaustPwm/2.0f}); 
@@ -433,27 +441,29 @@ void task_recomputeMotorStates()
   float intakeCACorrectionFactor = targetIntakeSpeed >= 50.0 ? targetIntakeSpeed / 50.0 : 1.0;
 
   PWM_COMMANDS[CA_IDX]          =
-    PWM_FANS.get(BYPASS_PWM).getState() > 0 ? 0.0 : 
     extrapolateGradualPWM(
-      coreAssistEnable ? coreAssistAmountC : 0.0, 
+      coreAssistEnable && PWM_FANS.get(BYPASS_PWM).getState() <= 0, 
+      coreAssistAmountC, 
       coreAssistRange * intakeCACorrectionFactor, 
-      coreAssistRange/20.0, 
+      coreAssistRange/20.0f, 
       INTAKE_MIN, 
       tempControlMaxSpeed, 
       PWM_COMMANDS[CA_IDX], 
-      tempControlMaxChange
+      tempControlMaxChange,
+      CA_PID_CONTROLLER
     );
 
   PWM_COMMANDS[BYPASS_IDX]      =        
-    PWM_FANS.get(CORE_ASSIST_PWM).getState() > 0 ? 0.0 :      
     extrapolateGradualPWM(
-      bypassEnable ? bypassAmountC : 0.0, 
+      bypassEnable && PWM_FANS.get(CORE_ASSIST_PWM).getState() <= 0,
+      bypassAmountC, 
       bypassRange, 
-      bypassRange/20.0, 
+      bypassRange/20.0f, 
       INTAKE_MIN, 
       tempControlMaxSpeed, 
       PWM_COMMANDS[BYPASS_IDX], 
-      tempControlMaxChange
+      tempControlMaxChange,
+      BYPASS_PID_CONTROLLER
     );
 
   // Always idle the intake and outlet at PWM_MIN_DUTY_CYCLE so we have an accurate temp sample. 
