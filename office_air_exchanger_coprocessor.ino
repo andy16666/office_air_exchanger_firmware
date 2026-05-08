@@ -74,7 +74,7 @@
 // 100% + MARGIN. When the blower engages, the PWM is reduced by this value. 
 #define INTAKE_BLOWER_MARGIN  15.0
 #define CA_BLOWER_MARGIN      12.0
-#define EXHAUST_BLOWER_MARGIN 10.0
+#define EXHAUST_BLOWER_MARGIN 0.0
 #define BYPASS_BLOWER_MARGIN  12.0
 
 // Blowers cut in when pwm command exceeds the cutin value, and cut out
@@ -82,6 +82,8 @@
 // on whether or not the blower is actually on at time of calculation. 
 #define BLOWER_CUTIN_SPEED  55.0
 #define BLOWER_CUTOUT_SPEED 40.0
+#define EXHAUST_BLOWER_CUTIN_SPEED 65.0
+#define EXHAUST_BLOWER_CUTOUT_SPEED 60.0
 #define INTAKE_BLOWER_CUTIN_SPEED 80.0
 #define INTAKE_BLOWER_CUTOUT_SPEED 75.0
 
@@ -483,8 +485,8 @@ void task_recomputeMotorStates()
     calculateBlowerAdjustedPwm(PWM_COMMANDS[CA_IDX], INTAKE_MIN, tempControlMaxSpeed, BLOWERS.get(CORE_ASSIST_BLOWER_ON).getState(), CA_BLOWER_MARGIN)
   ); 
 
-  BLOWERS.get(INTAKE_BLOWER_ON     ).setCommand(calculateBlowerCommand(INTAKE_BLOWER_ON,      INTAKE_IDX  , INTAKE_BLOWER_CUTIN_SPEED, INTAKE_BLOWER_CUTOUT_SPEED));
-  BLOWERS.get(EXHAUST_BLOWER_ON    ).setCommand(calculateBlowerCommand(EXHAUST_BLOWER_ON,     EXHAUST_IDX ));
+  BLOWERS.get(INTAKE_BLOWER_ON     ).setCommand(calculateBlowerCommand(INTAKE_BLOWER_ON,      INTAKE_IDX  , INTAKE_BLOWER_CUTIN_SPEED , INTAKE_BLOWER_CUTOUT_SPEED));
+  BLOWERS.get(EXHAUST_BLOWER_ON    ).setCommand(calculateBlowerCommand(EXHAUST_BLOWER_ON,     EXHAUST_IDX , EXHAUST_BLOWER_CUTIN_SPEED, EXHAUST_BLOWER_CUTOUT_SPEED));
   BLOWERS.get(BYPASS_BLOWER_ON     ).setCommand(calculateBlowerCommand(BYPASS_BLOWER_ON,      BYPASS_IDX  ));
   BLOWERS.get(CORE_ASSIST_BLOWER_ON).setCommand(calculateBlowerCommand(CORE_ASSIST_BLOWER_ON, CA_IDX      ));
 }

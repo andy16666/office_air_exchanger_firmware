@@ -23,7 +23,7 @@
 #define HOSTNAME "e3mvent"
 #define PWM_MIN 28
 #define TARGET_HOTEND_TEMP_C 30
-#define TARGET_FRONT_STACK_TEMP_C 20
+#define TARGET_FRONT_STACK_TEMP_C 25
 
 
 #include <stdint.h>
@@ -40,8 +40,6 @@
 #include <PIDController.h> 
 
 using namespace AOS; 
-
-#define TRANSITION_TIME_MS 5000
 
 PWMFan UNDER_SHELF_MAIN_PWM("underShelfMain", 6, PWM_MIN, 30, 100); 
 PWMFan HOTEND_EXHAUST_PWM("hotendExhaust", 7, PWM_MIN, 30, 100); 
@@ -100,9 +98,7 @@ bool handleHttpArg(String argName, String arg)
 
 void task_processCommands()
 {
-  float e3mFrontStackTempToTargetFrontStackTempC = computeGradientC(TEMPERATURES[E3M_FRONT_STACK_TEMP], TARGET_FRONT_STACK_TEMP_C, 0.1); 
-  float hotendTempToTargetHotendTempC            = computeGradientC(TEMPERATURES[HOTEND_TEMP], TARGET_HOTEND_TEMP_C, 0.1); 
-  
+  float hotendTempToTargetHotendTempC            = computeGradientC(TEMPERATURES[HOTEND_TEMP], TARGET_HOTEND_TEMP_C, 0.1);  
   float hotendPwm =
       extrapolatePWM(
         TEMPERATURES[HOTEND_TEMP] > TARGET_HOTEND_TEMP_C,
@@ -110,11 +106,12 @@ void task_processCommands()
         10.0, 0.1, PWM_MIN, 100, HOTEND_EXHAUST_PID_CONTROLLER
       );
 
+  float e3mFrontStackTempToTargetFrontStackTempC = computeGradientC(TEMPERATURES[E3M_FRONT_STACK_TEMP], TARGET_FRONT_STACK_TEMP_C, 0.1); 
   float frontStackPwm = 
       extrapolatePWM(
         TEMPERATURES[E3M_FRONT_STACK_TEMP] > TARGET_FRONT_STACK_TEMP_C,
         e3mFrontStackTempToTargetFrontStackTempC, 
-        15.0, 0.1, PWM_MIN, 100, UNDER_SHELF_MAIN_PID_CONTROLLER
+        10.0, 0.1, PWM_MIN, 100, UNDER_SHELF_MAIN_PID_CONTROLLER
       );
 
   HOTEND_EXHAUST_PWM.setCommand(hotendPwm); 

@@ -22,8 +22,8 @@
 #define PWM_FREQUENCY 100000
 
 //#define IN_OFFICE 1
-//#define IN_MB 1
-#define IN_LR 1
+#define IN_MB 1
+//#define IN_LR 1
 
 #ifdef IN_MB
 #define HAS_AC_DATA 1
@@ -185,9 +185,9 @@ void task_processCommands()
 
   switch(AC.getFanState())
   {
-    case AC_FAN_HIGH: commandFromACState = 50.0;  break;
-    case AC_FAN_MED:  commandFromACState = 20.0;  break;
-    case AC_FAN_LOW:  commandFromACState = 8.0;   break;
+    case AC_FAN_HIGH: commandFromACState = 30.0;  break;
+    case AC_FAN_MED:  commandFromACState = 15.0;  break;
+    case AC_FAN_LOW:  commandFromACState = 5.0;   break;
     case AC_FAN_OFF:  commandFromACState = 0.0;   break;
     default:          commandFromACState = 0.0;   break;
   }
