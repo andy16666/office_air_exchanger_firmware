@@ -19,18 +19,20 @@
     GitHub: andy16666
  */
 
-#define PWM_FREQUENCY 25000
+#define PWM_FREQUENCY 22000
 #define HOSTNAME "e3mvent"
+
 #define PWM_MIN 28
-#define HOTEND_PWM_MIN 50
+#define HOTEND_PWM_MIN 35
+#define PWM_MIN_NOCTUA_INDUSTRIAL 20
+#define PWM_MIN_4500_24V 35
+
 #define TARGET_HOTEND_TEMP_C 30
 #define TARGET_FRONT_STACK_TEMP_C 23
 #define TARGET_PSU_TEMP_C 30
 #define TARGET_ENCLOSURE_TEMP_C 35
 #define TARGET_UNDER_SHELF_MAIN_TEMP_C 25
 #define TARGET_UNDER_SHELF_VENT_TEMP_C 23
-
-
 
 #include <stdint.h>
 #include <float.h>
@@ -47,27 +49,29 @@
 
 using namespace AOS; 
 
-PWMFan ENCLOSURE_FAN_PWM("enclosureFan", 6, PWM_MIN, 30, 100); 
-PWMFan HOTEND_EXHAUST_PWM("hotendExhaust", 7, HOTEND_PWM_MIN, 30, 100); 
+PWMFans FANS(PWM_MIN, PWM_MIN + 20); 
 
-PWMFan E3M_FRONT_STACK_FAN_PWM("frontStackFan", 10, PWM_MIN, 30, 100); 
-PWMFan UNDER_SHELF_VENT_FAN_PWM("underShelfVent", 11, PWM_MIN, 30, 100); 
-PWMFan UNDER_SHELF_MAIN_PWM("underShelfMain", 12, PWM_MIN, 30, 100); 
-PWMFan E3M_PSU_PWM("psuExhaust", 13, PWM_MIN, 30, 100); 
-
-PIDController ENCLOSURE_PID_CONTROLLER(120, 0.5, 0.5, 0.5);
-PIDController UNDER_SHELF_MAIN_PID_CONTROLLER(120, 0.5, 0.5, 0.5);
-PIDController UNDER_SHELF_VENT_PID_CONTROLLER(120, 0.5, 0.5, 0.5);
-PIDController HOTEND_EXHAUST_PID_CONTROLLER(120, 0.5, 0.5, 0.5);
-PIDController E3M_PSU_PID_CONTROLLER(120, 0.5, 0.5, 0.5);
-PIDController E3M_FRONT_STACK_PID_CONTROLLER(120, 0.5, 0.5, 0.5);
-
+PIDController ENCLOSURE_PID_CONTROLLER(120, 0.5, 0.6, 0.76);
+PIDController UNDER_SHELF_MAIN_PID_CONTROLLER(120, 0.5, 0.9, 0.75);
+PIDController UNDER_SHELF_VENT_PID_CONTROLLER(120, 0.5, 0.5, 0.9);
+PIDController HOTEND_EXHAUST_PID_CONTROLLER(120, 0.5, 0.75, 0.9);
+PIDController E3M_PSU_PID_CONTROLLER(120, 0.5, 0.5, 0.9);
+PIDController E3M_FRONT_STACK_PID_CONTROLLER(120, 0.5, 0.75, 0.9);
 
 #define E3M_FRONT_STACK_TEMP 32
 #define HOTEND_TEMP 188
 #define UNDER_SHELF_MAIN_TEMP 149
 #define UNDER_SHELF_VENT_TEMP 161
 #define E3M_PSU_TEMP 148
+
+#define ENCLOSURE_FAN_PWM 8
+#define HOTEND_EXHAUST_PWM 9
+
+#define E3M_FRONT_STACK_FAN_PWM 10
+#define UNDER_SHELF_VENT_FAN_PWM 11
+#define UNDER_SHELF_MAIN_PWM 12
+#define E3M_PSU_PWM 13
+
 
 const char* generateHostname()
 {
@@ -91,17 +95,22 @@ void aosSetup1()
 {
   analogWriteFreq(PWM_FREQUENCY); 
 
+  FANS.add("enclosureFan",   ENCLOSURE_FAN_PWM, PWM_MIN, 35); 
+
+  FANS.add("hotendExhaust",  HOTEND_EXHAUST_PWM,       HOTEND_PWM_MIN,            HOTEND_PWM_MIN + 10); 
+
+  FANS.add("frontStackFan",  E3M_FRONT_STACK_FAN_PWM,  PWM_MIN_NOCTUA_INDUSTRIAL, 30); 
+  FANS.add("underShelfVent", UNDER_SHELF_VENT_FAN_PWM, PWM_MIN_NOCTUA_INDUSTRIAL, 30); 
+
+  FANS.add("underShelfMain", UNDER_SHELF_MAIN_PWM,     PWM_MIN_4500_24V,          PWM_MIN_4500_24V + 10); 
+  FANS.add("psuExhaust",     E3M_PSU_PWM,              PWM_MIN_4500_24V,          PWM_MIN_4500_24V + 10); 
+
   CORE_1_KERNEL->add(CORE_1_KERNEL, task_processCommands, 1000);  
 }
 
 void populateHttpResponse(JsonDocument& document) 
 {
-  UNDER_SHELF_MAIN_PWM.addTo("fans", document); 
-  UNDER_SHELF_VENT_FAN_PWM.addTo("fans", document); 
-  HOTEND_EXHAUST_PWM.addTo("fans", document); 
-  ENCLOSURE_FAN_PWM.addTo("fans", document); 
-  E3M_PSU_PWM.addTo("fans", document); 
-  E3M_FRONT_STACK_FAN_PWM.addTo("fans", document);
+  FANS.addTo("fans", document); 
 }
 
 bool handleHttpArg(String argName, String arg) 
@@ -124,30 +133,43 @@ bool handleHttpArg(String argName, String arg)
 
 void task_processCommands()
 {
-  float hotendTempToTargetHotendTempC            = computeGradientC(TEMPERATURES[HOTEND_TEMP], TARGET_HOTEND_TEMP_C, 0.1);  
-  HOTEND_EXHAUST_PWM.setCommand(extrapolatePWM(
-        TEMPERATURES[HOTEND_TEMP] > TARGET_HOTEND_TEMP_C,
-        hotendTempToTargetHotendTempC, 
-        10.0, 0.1, HOTEND_PWM_MIN, 100, HOTEND_EXHAUST_PID_CONTROLLER
-      ));
-  HOTEND_EXHAUST_PWM.execute(); 
-
   float enclosureTempC = cpu.getTemperature(); 
   float e3mFrontStackTempToTargetTempC      = computeGradientC(TEMPERATURES[E3M_FRONT_STACK_TEMP],  TARGET_FRONT_STACK_TEMP_C, 0.1); 
   float underShelfMainTempToTargetTempC     = computeGradientC(TEMPERATURES[UNDER_SHELF_MAIN_TEMP], TARGET_UNDER_SHELF_MAIN_TEMP_C, 0.1);
   float underShelfVentTempToTargetTempC = computeGradientC(TEMPERATURES[UNDER_SHELF_VENT_TEMP], TARGET_UNDER_SHELF_VENT_TEMP_C, 0.1); 
   float e3mPsuTempToTargetTempC = computeGradientC(TEMPERATURES[E3M_PSU_TEMP], TARGET_PSU_TEMP_C, 0.1); 
   float enclosureTempToTargetTempC = computeGradientC(enclosureTempC, TARGET_ENCLOSURE_TEMP_C, 0.1); 
+  float hotendTempToTargetHotendTempC            = computeGradientC(TEMPERATURES[HOTEND_TEMP], TARGET_HOTEND_TEMP_C, 0.1);
 
+  FANS.get(ENCLOSURE_FAN_PWM).setCommand(extrapolatePWM(enclosureTempC > TARGET_ENCLOSURE_TEMP_C, enclosureTempToTargetTempC, 10.0, 0.1, PWM_MIN, 100, ENCLOSURE_PID_CONTROLLER));
 
-  UNDER_SHELF_MAIN_PWM.setCommand(extrapolatePWM(TEMPERATURES[UNDER_SHELF_MAIN_TEMP] > TARGET_UNDER_SHELF_MAIN_TEMP_C, underShelfMainTempToTargetTempC, 7.0, 0.1, PWM_MIN, 100, UNDER_SHELF_MAIN_PID_CONTROLLER));
-  UNDER_SHELF_MAIN_PWM.execute(); 
-  UNDER_SHELF_VENT_FAN_PWM.setCommand(extrapolatePWM(TEMPERATURES[UNDER_SHELF_VENT_TEMP] > TARGET_UNDER_SHELF_VENT_TEMP_C, underShelfVentTempToTargetTempC, 7.0, 0.1, PWM_MIN, 100, UNDER_SHELF_VENT_PID_CONTROLLER));
-  UNDER_SHELF_VENT_FAN_PWM.execute(); 
-  ENCLOSURE_FAN_PWM.setCommand(extrapolatePWM(enclosureTempC > TARGET_ENCLOSURE_TEMP_C, enclosureTempToTargetTempC, 10.0, 0.1, PWM_MIN, 100, ENCLOSURE_PID_CONTROLLER));
-  ENCLOSURE_FAN_PWM.execute();  
-  E3M_PSU_PWM.setCommand(extrapolatePWM(TEMPERATURES[E3M_PSU_TEMP] > TARGET_PSU_TEMP_C, e3mPsuTempToTargetTempC, 10.0, 0.1, PWM_MIN, 100, E3M_PSU_PID_CONTROLLER)); 
-  E3M_PSU_PWM.execute(); 
-  E3M_FRONT_STACK_FAN_PWM.setCommand(extrapolatePWM(TEMPERATURES[E3M_FRONT_STACK_TEMP] > TARGET_FRONT_STACK_TEMP_C, e3mFrontStackTempToTargetTempC, 7.0, 0.1, PWM_MIN, 100, E3M_FRONT_STACK_PID_CONTROLLER)); 
-  E3M_FRONT_STACK_FAN_PWM.execute(); 
+  FANS.get(HOTEND_EXHAUST_PWM)
+    .setCommand(
+      extrapolatePWM(
+        TEMPERATURES[HOTEND_TEMP] > TARGET_HOTEND_TEMP_C,
+        hotendTempToTargetHotendTempC, 
+        10.0, 0.1, HOTEND_PWM_MIN, 100, HOTEND_EXHAUST_PID_CONTROLLER
+      ));
+
+  FANS.get(UNDER_SHELF_MAIN_PWM)
+    .setCommand(
+      extrapolatePWM(
+        TEMPERATURES[UNDER_SHELF_MAIN_TEMP] > TARGET_UNDER_SHELF_MAIN_TEMP_C, 
+        underShelfMainTempToTargetTempC, 7.0, 0.1, PWM_MIN_4500_24V, 100, UNDER_SHELF_MAIN_PID_CONTROLLER
+      ));
+
+  FANS.get(E3M_PSU_PWM)
+    .setCommand(
+      extrapolatePWM(TEMPERATURES[E3M_PSU_TEMP] > TARGET_PSU_TEMP_C, e3mPsuTempToTargetTempC, 10.0, 0.1, PWM_MIN_4500_24V, 100, E3M_PSU_PID_CONTROLLER)); 
+
+  
+  FANS.get(UNDER_SHELF_VENT_FAN_PWM)
+    .setCommand(
+      extrapolatePWM(TEMPERATURES[UNDER_SHELF_VENT_TEMP] > TARGET_UNDER_SHELF_VENT_TEMP_C, underShelfVentTempToTargetTempC, 7.0, 0.1, PWM_MIN_NOCTUA_INDUSTRIAL, 100, UNDER_SHELF_VENT_PID_CONTROLLER));
+  
+  FANS.get(E3M_FRONT_STACK_FAN_PWM)
+    .setCommand(
+      extrapolatePWM(TEMPERATURES[E3M_FRONT_STACK_TEMP] > TARGET_FRONT_STACK_TEMP_C, e3mFrontStackTempToTargetTempC, 7.0, 0.1, PWM_MIN_NOCTUA_INDUSTRIAL, 100, E3M_FRONT_STACK_PID_CONTROLLER)); 
+
+  FANS.execute(); 
 }
