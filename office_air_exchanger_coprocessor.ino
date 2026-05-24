@@ -24,6 +24,15 @@
  */
 
  /* 
+  Pinout: 
+  - OneWire Temperature: GPIO2
+  - LCD: SDA: GPIO4, SCL: GPIO5, VCC: 5V
+  - Uplink to Gateway: Tx: GPIO6, TxEnable: GPIO7, Rx: GPIO8, RxEnable: GPIO9
+  - PWM Out: GPIO 10-13
+  - Relay Out: GPIO 18-21 
+
+  Outated Description: 
+
   This firmware is designed to run on a Raspberry Pi Pico and uses the MBed 
   RTos. It's written for a custom HRV/air exchanger which has 4 different control 
   axes: 
@@ -59,6 +68,9 @@
   reading of the resulting temperature after the core air and bypass air are mixed, 
   which informs the ratio of bypass to core assist used to achieve the target 
   temperature.
+
+  Author: Andrew Somerville <andy16666@gmail.com> 
+  GitHub: andy16666
   */ 
 
 #define HOSTNAME "officeae"

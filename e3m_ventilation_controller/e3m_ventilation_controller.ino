@@ -25,9 +25,10 @@
 #define PWM_MIN 28
 #define HOTEND_PWM_MIN 35
 #define PWM_MIN_NOCTUA_INDUSTRIAL 20
-#define PWM_MIN_4500_24V 35
+#define PWM_MIN_4500_24V 25
 
-#define TARGET_HOTEND_TEMP_C 30
+#define TARGET_DRYER_EXHAUST_TEMP 25
+#define TARGET_HOTEND_TEMP_C 28
 #define TARGET_FRONT_STACK_TEMP_C 23
 #define TARGET_PSU_TEMP_C 30
 #define TARGET_ENCLOSURE_TEMP_C 35
@@ -51,8 +52,9 @@ using namespace AOS;
 
 PWMFans FANS(PWM_MIN, PWM_MIN + 20); 
 
+PIDController DRYER_EXHAUST_PID_CONTROLLER(120, 0.5, 0.5, 0.5);
 PIDController ENCLOSURE_PID_CONTROLLER(120, 0.5, 0.6, 0.76);
-PIDController UNDER_SHELF_MAIN_PID_CONTROLLER(120, 0.5, 0.9, 0.75);
+PIDController UNDER_SHELF_MAIN_PID_CONTROLLER(300, 0.5, 0.75, 0.9);
 PIDController UNDER_SHELF_VENT_PID_CONTROLLER(120, 0.5, 0.5, 0.9);
 PIDController HOTEND_EXHAUST_PID_CONTROLLER(120, 0.5, 0.75, 0.9);
 PIDController E3M_PSU_PID_CONTROLLER(120, 0.5, 0.5, 0.9);
@@ -63,6 +65,7 @@ PIDController E3M_FRONT_STACK_PID_CONTROLLER(120, 0.5, 0.75, 0.9);
 #define UNDER_SHELF_MAIN_TEMP 149
 #define UNDER_SHELF_VENT_TEMP 161
 #define E3M_PSU_TEMP 148
+#define DRYER_EXHAUST_TEMP 90
 
 #define ENCLOSURE_FAN_PWM 8
 #define HOTEND_EXHAUST_PWM 9
@@ -71,6 +74,8 @@ PIDController E3M_FRONT_STACK_PID_CONTROLLER(120, 0.5, 0.75, 0.9);
 #define UNDER_SHELF_VENT_FAN_PWM 11
 #define UNDER_SHELF_MAIN_PWM 12
 #define E3M_PSU_PWM 13
+
+#define DRYER_EXHAUST_FAN_PWM 14
 
 
 const char* generateHostname()
@@ -89,6 +94,7 @@ void aosSetup()
   TEMPERATURES.add("Under Shelf Main Temp", "underShelfMainTemp", UNDER_SHELF_MAIN_TEMP);
   TEMPERATURES.add("Under Shelf Vent Tep", "underShelfVentTemp", UNDER_SHELF_VENT_TEMP);
   TEMPERATURES.add("PSU Temp", "psuTemp", E3M_PSU_TEMP);
+  TEMPERATURES.add("Dryer Exhaust Temp", "dryerExhaustTemp", DRYER_EXHAUST_TEMP);
 }
 
 void aosSetup1()
@@ -104,6 +110,8 @@ void aosSetup1()
 
   FANS.add("underShelfMain", UNDER_SHELF_MAIN_PWM,     PWM_MIN_4500_24V,          PWM_MIN_4500_24V + 10); 
   FANS.add("psuExhaust",     E3M_PSU_PWM,              PWM_MIN_4500_24V,          PWM_MIN_4500_24V + 10); 
+
+  FANS.add("dryerExhaust",   DRYER_EXHAUST_FAN_PWM,              PWM_MIN_4500_24V,          PWM_MIN_4500_24V + 10); 
 
   CORE_1_KERNEL->add(CORE_1_KERNEL, task_processCommands, 1000);  
 }
@@ -140,6 +148,8 @@ void task_processCommands()
   float e3mPsuTempToTargetTempC = computeGradientC(TEMPERATURES[E3M_PSU_TEMP], TARGET_PSU_TEMP_C, 0.1); 
   float enclosureTempToTargetTempC = computeGradientC(enclosureTempC, TARGET_ENCLOSURE_TEMP_C, 0.1); 
   float hotendTempToTargetHotendTempC            = computeGradientC(TEMPERATURES[HOTEND_TEMP], TARGET_HOTEND_TEMP_C, 0.1);
+  float dryerExhaustTempToTargetTempC            = computeGradientC(TEMPERATURES[DRYER_EXHAUST_TEMP], TARGET_DRYER_EXHAUST_TEMP, 0.1);
+
 
   FANS.get(ENCLOSURE_FAN_PWM).setCommand(extrapolatePWM(enclosureTempC > TARGET_ENCLOSURE_TEMP_C, enclosureTempToTargetTempC, 10.0, 0.1, PWM_MIN, 100, ENCLOSURE_PID_CONTROLLER));
 
@@ -148,7 +158,7 @@ void task_processCommands()
       extrapolatePWM(
         TEMPERATURES[HOTEND_TEMP] > TARGET_HOTEND_TEMP_C,
         hotendTempToTargetHotendTempC, 
-        10.0, 0.1, HOTEND_PWM_MIN, 100, HOTEND_EXHAUST_PID_CONTROLLER
+        20.0, 0.1, HOTEND_PWM_MIN, 100, HOTEND_EXHAUST_PID_CONTROLLER
       ));
 
   FANS.get(UNDER_SHELF_MAIN_PWM)
@@ -170,6 +180,10 @@ void task_processCommands()
   FANS.get(E3M_FRONT_STACK_FAN_PWM)
     .setCommand(
       extrapolatePWM(TEMPERATURES[E3M_FRONT_STACK_TEMP] > TARGET_FRONT_STACK_TEMP_C, e3mFrontStackTempToTargetTempC, 7.0, 0.1, PWM_MIN_NOCTUA_INDUSTRIAL, 100, E3M_FRONT_STACK_PID_CONTROLLER)); 
+
+  FANS.get(DRYER_EXHAUST_FAN_PWM)
+    .setCommand(
+      extrapolatePWM(TEMPERATURES[DRYER_EXHAUST_TEMP] > TARGET_DRYER_EXHAUST_TEMP, dryerExhaustTempToTargetTempC, 5.0, 0.1, PWM_MIN_4500_24V, 100, DRYER_EXHAUST_PID_CONTROLLER)); 
 
   FANS.execute(); 
 }

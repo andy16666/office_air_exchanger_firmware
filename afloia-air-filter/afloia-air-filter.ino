@@ -14,9 +14,14 @@
  */
 
 /*
-   
-    Author: Andrew Somerville <andy16666@gmail.com> 
-    GitHub: andy16666
+  Controls an Afloia air filter. 
+
+  Pinout: 
+  - GPIO2: OneWire Temp
+  - Fan PWM pin: GPIO6
+
+  Author: Andrew Somerville <andy16666@gmail.com> 
+  GitHub: andy16666
  */
 
 #define PWM_FREQUENCY 100000
